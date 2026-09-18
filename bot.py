@@ -1,101 +1,114 @@
+import os
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from datetime import datetime
-import os
 
+# Загрузка переменных окружения из файла .env
 load_dotenv()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 
 if not TOKEN:
-    raise ValueError("Токен не найден! Проверьте файл .env")
+    print("Ошибка: Токен не найден. Проверьте файл .env")
+    exit()
 
-# Создаем бота с префиксом команд
+# Настройка интентов
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Хранилище балансов пользователей (в памяти)
-# В реальном проекте лучше использовать базу данных
+# Хранилище балансов (в памяти)
 balances = {}
 
 
-def get_balance(user_id: int) -> int:
-    """Получить баланс пользователя"""
+def get_balance(user_id):
     return balances.get(user_id, 0)
 
 
-def set_balance(user_id: int, amount: int) -> int:
-    """Установить баланс пользователя"""
+def set_balance(user_id, amount):
     balances[user_id] = amount
-    return amount
 
 
-def add_balance(user_id: int, amount: int) -> int:
-    """Прибавить к балансу пользователя"""
+def add_balance(user_id, amount):
+    balances[user_id] = get_balance(user_id) + amount
+
+
+def remove_balance(user_id, amount):
     current = get_balance(user_id)
-    new_balance = current + amount
-    balances[user_id] = new_balance
-    return new_balance
-
-
-def remove_balance(user_id: int, amount: int) -> int:
-    """Уменьшить баланс пользователя"""
-    current = get_balance(user_id)
-    new_balance = max(0, current - amount)  # Не уходим в минус
-    balances[user_id] = new_balance
-    return new_balance
+    if current >= amount:
+        balances[user_id] = current - amount
+        return True
+    return False
 
 
 @bot.event
 async def on_ready():
     print(f'Бот запущен как {bot.user}')
+    try:
+        synced = await bot.tree.sync()
+        print(f"Синхронизировано {len(synced)} слэш-команд.")
+    except Exception as e:
+        print(f"Ошибка синхронизации команд: {e}")
 
 
-# === Команды для управления балансом ===
+# --- Слэш команды ---
 
-@bot.command(name='баланс')
-async def check_balance(ctx):
-    """Проверить свой баланс"""
-    balance = get_balance(ctx.author.id)
-    await ctx.send(f'💰 Ваш баланс: {balance} монет')
+@bot.tree.command(name="баланс", description="Показать баланс пользователя")
+async def balance(ctx, user: discord.User = None):
+    if user is None:
+        user = ctx.user
+
+    amount = get_balance(user.id)
+    # Используем .name вместо .mention, чтобы не пинговать
+    await ctx.response.send_message(f"💰 Баланс пользователя **{user.name}**: **{amount}** монет.", ephemeral=False)
 
 
-@bot.command(name='set')
-async def set_balance_cmd(ctx, amount: int):
-    """Установить баланс (только для тестов)"""
-    if amount < 0:
-        await ctx.send('❌ Сумма не может быть отрицательной!')
+@bot.tree.command(name="set", description="Установить баланс пользователю (Только админы)")
+async def set_bal(ctx, user: discord.User, amount: int):
+    if not ctx.user.guild_permissions.administrator and ctx.user.id != ctx.guild.owner_id:
+        await ctx.response.send_message("❌ У вас нет прав для использования этой команды.", ephemeral=True)
         return
-    
-    set_balance(ctx.author.id, amount)
-    await ctx.send(f'✅ Баланс установлен на {amount} монет')
+
+    set_balance(user.id, amount)
+    await ctx.response.send_message(f"✅ Баланс пользователя **{user.name}** установлен на **{amount}** монет.")
 
 
-@bot.command(name='add')
-async def add_balance_cmd(ctx, amount: int):
-    """Прибавить к балансу (только для тестов)"""
-    if amount < 0:
-        await ctx.send('❌ Сумма не может быть отрицательной!')
+@bot.tree.command(name="add", description="Добавить деньги пользователю (Только админы)")
+async def add_bal(ctx, user: discord.User, amount: int):
+    if not ctx.user.guild_permissions.administrator and ctx.user.id != ctx.guild.owner_id:
+        await ctx.response.send_message("❌ У вас нет прав для использования этой команды.", ephemeral=True)
         return
-    
-    new_balance = add_balance(ctx.author.id, amount)
-    await ctx.send(f'➕ Добавлено {amount} монет. Новый баланс: {new_balance}')
 
-
-@bot.command(name='remove')
-async def remove_balance_cmd(ctx, amount: int):
-    """Уменьшить баланс (только для тестов)"""
     if amount < 0:
-        await ctx.send('❌ Сумма не может быть отрицательной!')
+        await ctx.response.send_message("❌ Сумма должна быть положительной.", ephemeral=True)
         return
-    
-    new_balance = remove_balance(ctx.author.id, amount)
-    await ctx.send(f'➖ Убрано {amount} монет. Новый баланс: {new_balance}')
+
+    add_balance(user.id, amount)
+    new_bal = get_balance(user.id)
+    await ctx.response.send_message(
+        f"➕ Добавлено **{amount}** монет пользователю **{user.name}**. Новый баланс: **{new_bal}**.")
+
+
+@bot.tree.command(name="remove", description="Убрать деньги у пользователя (Только админы)")
+async def remove_bal(ctx, user: discord.User, amount: int):
+    if not ctx.user.guild_permissions.administrator and ctx.user.id != ctx.guild.owner_id:
+        await ctx.response.send_message("❌ У вас нет прав для использования этой команды.", ephemeral=True)
+        return
+
+    if amount < 0:
+        await ctx.response.send_message("❌ Сумма должна быть положительной.", ephemeral=True)
+        return
+
+    success = remove_balance(user.id, amount)
+    if success:
+        new_bal = get_balance(user.id)
+        await ctx.response.send_message(f"➖ Убрано **{amount}** монет у **{user.name}**. Новый баланс: **{new_bal}**.")
+    else:
+        await ctx.response.send_message(
+            f"❌ У пользователя **{user.name}** недостаточно средств (Текущий баланс: {get_balance(user.id)}).")
 
 
 # Запуск бота
-if __name__ == '__main__':
-    # ЗАМЕНИТЕ 'YOUR_BOT_TOKEN' на токен вашего бота из Discord Developer Portal
-    bot.run(TOKEN)
+bot.run(TOKEN)
