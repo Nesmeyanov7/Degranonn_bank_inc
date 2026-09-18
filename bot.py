@@ -88,4 +88,4 @@ async def remove_balance_cmd(ctx, amount: int):
 # Запуск бота
 if __name__ == '__main__':
     # ЗАМЕНИТЕ 'YOUR_BOT_TOKEN' на токен вашего бота из Discord Developer Portal
-    bot.run('YOUR_BOT_TOKEN')
+    bot.run('MTU1MDUzOTc2NzIyODQwNzk3OA.Gvlva8.EycAWDy04fjTst0LN9XqdqRAym3-Yx5jizYKpo')
