@@ -1,5 +1,15 @@
 import discord
 from discord.ext import commands
+from dotenv import load_dotenv
+from datetime import datetime
+import os
+
+load_dotenv()
+
+TOKEN = os.getenv('DISCORD_TOKEN')
+
+if not TOKEN:
+    raise ValueError("Токен не найден! Проверьте файл .env")
 
 # Создаем бота с префиксом команд
 intents = discord.Intents.default()
@@ -88,4 +98,4 @@ async def remove_balance_cmd(ctx, amount: int):
 # Запуск бота
 if __name__ == '__main__':
     # ЗАМЕНИТЕ 'YOUR_BOT_TOKEN' на токен вашего бота из Discord Developer Portal
-    bot.run('MTU1MDUzOTc2NzIyODQwNzk3OA.Gvlva8.EycAWDy04fjTst0LN9XqdqRAym3-Yx5jizYKpo')
+    bot.run(TOKEN)
