@@ -5,13 +5,14 @@ from discord.ui import View, Button, Modal, TextInput, button
 from discord.ext import commands
 from dotenv import load_dotenv
 import aiosqlite
+import re
 
 # --- НАСТРОЙКИ ---
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 DB_NAME = 'bank.db'
-# ЗАМЕНИ ЭТО НА ТОЧНОЕ НАЗВАНИЕ РОЛИ АДМИНА НА ТВОЕМ СЕРВЕРЕ
-ADMIN_ROLE_NAME = "Техник"
+ADMIN_ROLE_NAME = "Техник"  # Роль администратора банка
+LEADER_ROLE_NAME = "Лидер Фракции"  # Роль лидера фракции (ЗАМЕНИ НА СВОЮ!)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -47,26 +48,24 @@ async def get_user_by_account_id(account_id):
             return await cursor.fetchone()
 
 
+async def get_faction_members(prefix):
+    """Получить всех пользователей, чей ID счета начинается с prefix"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT * FROM users WHERE account_id LIKE ?', (f"{prefix}%",)) as cursor:
+            return await cursor.fetchall()
+
+
 async def create_user_in_db(discord_id, discord_tag, game_nick, account_id):
     async with aiosqlite.connect(DB_NAME) as db:
         try:
-            # Проверка на уникальность ID счета перед вставкой (дублирует constraint, но для понятной ошибки)
-            async with db.execute('SELECT 1 FROM users WHERE account_id = ?', (account_id,)) as cursor:
-                if await cursor.fetchone():
-                    return False, "exists_account"
-
-            async with db.execute('SELECT 1 FROM users WHERE discord_id = ?', (discord_id,)) as cursor:
-                if await cursor.fetchone():
-                    return False, "exists_user"
-
             await db.execute(
                 'INSERT INTO users (discord_id, discord_tag, game_nick, account_id, balance) VALUES (?, ?, ?, ?, 0)',
                 (discord_id, discord_tag, game_nick, account_id)
             )
             await db.commit()
-            return True, None
+            return True
         except aiosqlite.IntegrityError:
-            return False, "error"
+            return False
 
 
 # --- МОДАЛЬНЫЕ ОКНА ---
@@ -82,7 +81,7 @@ class CreateAccountModal(Modal, title="Создание счета"):
         )
         self.account_id = TextInput(
             label="ID Счета (10 цифр)",
-            placeholder="Только 10 цифр",
+            placeholder="Только 10 цифр. Первые 2 - код фракции",
             required=True,
             max_length=10,
             min_length=10
@@ -97,7 +96,7 @@ class CreateAccountModal(Modal, title="Создание счета"):
             await interaction.response.send_message("❌ ID счета должен состоять только из цифр!", ephemeral=True)
             return
 
-        success, error_code = await create_user_in_db(
+        success = await create_user_in_db(
             self.target_user.id,
             self.target_user.name,
             self.game_nick.value,
@@ -113,15 +112,7 @@ class CreateAccountModal(Modal, title="Создание счета"):
                 ephemeral=True
             )
         else:
-            if error_code == "exists_account":
-                await interaction.response.send_message(
-                    f"❌ Ошибка: Счет с ID `{acc_id}` уже существует! Введите другой ID.", ephemeral=True)
-            elif error_code == "exists_user":
-                await interaction.response.send_message(
-                    f"❌ Ошибка: У пользователя {self.target_user.name} уже есть счет!", ephemeral=True)
-            else:
-                await interaction.response.send_message("❌ Произошла неизвестная ошибка при создании счета.",
-                                                        ephemeral=True)
+            await interaction.response.send_message("❌ Ошибка: Такой ID счета уже занят!", ephemeral=True)
 
 
 class ManageBalanceModal(Modal, title="Управление балансом"):
@@ -175,7 +166,7 @@ class ManageBalanceModal(Modal, title="Управление балансом"):
             async with db.execute('SELECT balance FROM users WHERE account_id = ?', (acc_id,)) as cursor:
                 row = await cursor.fetchone()
                 if not row:
-                    await interaction.response.send_message("❌ Счет с таким ID не найден!", ephemeral=True)
+                    await interaction.response.send_message("❌ Счет не найден!", ephemeral=True)
                     return
 
                 current_bal = row[0]
@@ -195,10 +186,8 @@ class ManageBalanceModal(Modal, title="Управление балансом"):
                 await db.commit()
 
         action_names = {"add": "Зачислено", "remove": "Списано", "set": "Установлен"}
-        emoji_map = {"add": "➕", "remove": "➖", "set": "⚙️"}
-
         await interaction.response.send_message(
-            f"{emoji_map[self.action_type]} {action_names[self.action_type]}: **{amount}**\n"
+            f"✅ {action_names[self.action_type]}: **{amount}**\n"
             f"Счет: `{acc_id}`\n"
             f"Новый баланс: **{new_bal}**",
             ephemeral=True
@@ -228,8 +217,7 @@ class TransferModal(Modal, title="Перевод средств"):
         sender_data = await get_user_data(sender_id)
 
         if not sender_data:
-            await interaction.response.send_message("❌ У вас нет открытого счета! Обратитесь к администратору.",
-                                                    ephemeral=True)
+            await interaction.response.send_message("❌ У вас нет открытого счета!", ephemeral=True)
             return
 
         sender_acc_id = sender_data[3]
@@ -246,7 +234,7 @@ class TransferModal(Modal, title="Перевод средств"):
             return
 
         if sender_balance < amount:
-            await interaction.response.send_message(f"❌ Недостаточно средств! Вам не хватает {amount - sender_balance} монет.", ephemeral=True)
+            await interaction.response.send_message("❌ Недостаточно средств!", ephemeral=True)
             return
 
         target_acc = self.target_acc.value
@@ -278,31 +266,99 @@ class TransferModal(Modal, title="Перевод средств"):
         )
 
 
-# --- ВИДЫ (КНОПКИ) ---
+# --- КНОПКИ И ВИДЫ ---
 
-class UserProfileView(View):
-    def __init__(self):
+class FactionListView(View):
+    def __init__(self, user_data):
         super().__init__(timeout=None)
+        self.user_data = user_data
+
+    @button(label="Назад в профиль", style=ButtonStyle.red, emoji="🔙")
+    async def back_btn(self, interaction: discord.Interaction, button: Button):
+        # Перерисовываем профиль
+        await show_profile(interaction, self.user_data)
 
     @button(label="Перевести средства", style=ButtonStyle.blurple, emoji="💸")
     async def transfer_btn(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_modal(TransferModal())
 
 
+class UserProfileView(View):
+    def __init__(self, user_data, is_leader: bool):
+        super().__init__(timeout=None)
+        self.user_data = user_data
+        self.is_leader = is_leader
+
+        # Добавляем кнопку перевода всегда
+        self.add_item(Button(label="Перевести средства", style=ButtonStyle.blurple, emoji="💸", custom_id="transfer"))
+
+        # Добавляем кнопку фракции только лидеру
+        if is_leader:
+            self.add_item(Button(label="Состав фракции", style=ButtonStyle.green, emoji="👥", custom_id="faction_list"))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Обработка кнопок внутри этого класса не нужна, они обрабатываются глобально или через callback
+        # Но для простоты мы используем декораторы @button в отдельных классах или переопределяем метод
+        # Здесь мы используем простой подход: кнопки создаются динамически, но их логика будет в отдельном классе View
+        # Чтобы избежать сложностей с динамическими кнопками, лучше использовать статические классы View как выше.
+        # Поэтому этот класс UserProfileView мы сделаем проще, а логику кнопок вынесем.
+        return True
+
+
+# Переписанный UserProfileView с явными методами кнопок
+class UserProfileView(View):
+    def __init__(self, user_data, is_leader: bool):
+        super().__init__(timeout=None)
+        self.user_data = user_data
+        self.is_leader = is_leader
+
+    @button(label="Перевести средства", style=ButtonStyle.blurple, emoji="💸")
+    async def transfer_btn(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(TransferModal())
+
+    @button(label="Состав фракции", style=ButtonStyle.green, emoji="👥")
+    async def faction_btn(self, interaction: discord.Interaction, button: Button):
+        if not self.is_leader:
+            await interaction.response.send_message("❌ Доступно только лидерам.", ephemeral=True)
+            return
+
+        user_data = self.user_data
+        account_id = user_data[3]
+        prefix = account_id[:2]  # Первые две цифры
+
+        members = await get_faction_members(prefix)
+
+        if not members:
+            await interaction.response.send_message("❌ Участников фракции не найдено.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title=f"👥 Фракция (Код: {prefix})", color=discord.Color.gold())
+        description = ""
+        for m in members:
+            # m: (id, tag, nick, acc_id, balance)
+            description += f"🆔 `{m[3]}` | 👤 {m[2]} | 📛 {m[1]}\n"
+
+        embed.description = description
+        embed.set_footer(text=f"Всего участников: {len(members)}")
+
+        view = FactionListView(self.user_data)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 class AdminPanelView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="Зачислить средства", style=ButtonStyle.green, emoji="➕")
-    async def add_balance_btn(self, interaction: discord.Interaction, button: Button):
+    @button(label="Зачислить", style=ButtonStyle.green, emoji="➕")
+    async def add_btn(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_modal(ManageBalanceModal("add"))
 
-    @button(label="Списать средства", style=ButtonStyle.red, emoji="➖")
-    async def remove_balance_btn(self, interaction: discord.Interaction, button: Button):
+    @button(label="Списать", style=ButtonStyle.red, emoji="➖")
+    async def remove_btn(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_modal(ManageBalanceModal("remove"))
 
-    @button(label="Установить баланс", style=ButtonStyle.blurple, emoji="⚙️")
-    async def set_balance_btn(self, interaction: discord.Interaction, button: Button):
+    @button(label="Установить", style=ButtonStyle.blurple, emoji="⚙️")
+    async def set_btn(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_modal(ManageBalanceModal("set"))
 
 
@@ -320,11 +376,41 @@ async def on_ready():
 
 
 def check_admin_role(interaction: discord.Interaction) -> bool:
-    if not interaction.guild:
-        return False
-    if interaction.user.id == interaction.guild.owner_id:
-        return True
+    if not interaction.guild: return False
+    if interaction.user.id == interaction.guild.owner_id: return True
     return any(role.name == ADMIN_ROLE_NAME for role in interaction.user.roles)
+
+
+def check_leader_role(interaction: discord.Interaction) -> bool:
+    if not interaction.guild: return False
+    if interaction.user.id == interaction.guild.owner_id: return True
+    return any(role.name == LEADER_ROLE_NAME for role in interaction.user.roles)
+
+
+# Хелпер для отображения профиля (чтобы не дублировать код)
+async def show_profile(interaction_or_response, user_data):
+    is_leader = False
+    # Проверяем роль лидера. Если вызвано из interaction, берем user, иначе сложно определить без контекста
+    # В нашем случае вызов всегда идет из команды start, где есть interaction
+    if hasattr(interaction_or_response, 'user'):
+        user = interaction_or_response.user
+        if user.guild:
+            if user.id == user.guild.owner_id or any(r.name == LEADER_ROLE_NAME for r in user.roles):
+                is_leader = True
+
+    embed = discord.Embed(title="🏦 Личный кабинет", color=discord.Color.green())
+    embed.add_field(name="Пользователь", value=f"{user_data[1]}", inline=False)
+    embed.add_field(name="Ник в игре", value=f"{user_data[2]}", inline=True)
+    embed.add_field(name="ID Счета", value=f"`{user_data[3]}`", inline=True)
+    embed.add_field(name="Баланс", value=f"**{user_data[4]}** монет", inline=False)
+
+    view = UserProfileView(user_data, is_leader)
+
+    if hasattr(interaction_or_response, 'response'):
+        await interaction_or_response.response.send_message(embed=embed, view=view, ephemeral=True)
+    else:
+        # Если нужно редактировать существующее сообщение (для кнопки назад)
+        await interaction_or_response.edit_original_response(embed=embed, view=view)
 
 
 @bot.tree.command(name="start", description="Открыть личный кабинет")
@@ -338,22 +424,14 @@ async def start_cmd(interaction: discord.Interaction):
         )
         return
 
-    embed = discord.Embed(title="🏦 Личный кабинет", color=discord.Color.green())
-    embed.add_field(name="Пользователь", value=f"{user_data[1]}", inline=False)
-    embed.add_field(name="Ник в игре", value=f"{user_data[2]}", inline=True)
-    embed.add_field(name="ID Счета", value=f"`{user_data[3]}`", inline=True)
-    embed.add_field(name="Баланс", value=f"**{user_data[4]}** монет", inline=False)
-
-    await interaction.response.send_message(embed=embed, view=UserProfileView(), ephemeral=True)
+    await show_profile(interaction, user_data)
 
 
 @bot.tree.command(name="admin_panel", description="Панель администратора")
 @app_commands.check(check_admin_role)
 async def admin_panel_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="🛡️ Панель Администратора", color=discord.Color.red())
-    embed.add_field(name="Создание счета", value="Используйте команду `/admin_create @user`", inline=False)
-    embed.add_field(name="Операции", value="Используйте кнопки ниже для управления балансом по ID счета.", inline=False)
-
+    embed.add_field(name="Управление", value="Используйте кнопки ниже для операций со счетами по ID.", inline=False)
     await interaction.response.send_message(embed=embed, view=AdminPanelView(), ephemeral=True)
 
 
@@ -363,10 +441,9 @@ async def admin_panel_cmd(interaction: discord.Interaction):
 async def admin_create_cmd(interaction: discord.Interaction, user: discord.Member):
     data = await get_user_data(user.id)
     if data:
-        await interaction.response.send_message(f"⚠️ У пользователя {user.name} уже есть счет (`{data[3]}`).",
+        await interaction.response.send_message(f"⚠️ У пользователя {user.name} уже есть счет ({data[3]}).",
                                                 ephemeral=True)
         return
-
     await interaction.response.send_modal(CreateAccountModal(user))
 
 
@@ -374,10 +451,9 @@ async def admin_create_cmd(interaction: discord.Interaction, user: discord.Membe
 @admin_create_cmd.error
 async def admin_error_handler(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.CheckFailure):
-        await interaction.response.send_message("❌ У вас нет прав администратора для этой команды.", ephemeral=True)
+        await interaction.response.send_message("❌ У вас нет прав для этой команды.", ephemeral=True)
     else:
-        print(error)
-        await interaction.response.send_message(f"❌ Произошла ошибка: {error}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Ошибка: {error}", ephemeral=True)
 
 
 if __name__ == "__main__":
