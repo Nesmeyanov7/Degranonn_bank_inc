@@ -15,6 +15,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 DB_NAME = 'bank.db'
 ADMIN_ROLE_NAME = "Техник"
 LEADER_ROLE_NAME = "Лидер Фракции"
+MAX_AMOUNT = 1_000_000_000_000  # Защита от переполнения SQLite INTEGER (макс. 1 триллион за операцию)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -25,12 +26,15 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # Структура: {user_id: [{"msg": str, "read": bool, "time": str}]}
 user_notifications = {}
 
+RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MSK_TZ = datetime.timezone(datetime.timedelta(hours=3), name="MSK")
+
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def get_msk_now() -> datetime.datetime:
-    """Возвращает текущее время по МСК (UTC+3)"""
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
+    """Возвращает точное московское время (UTC+3) независимо от часового пояса хостинга"""
+    return datetime.datetime.now(datetime.timezone.utc).astimezone(MSK_TZ)
 
 
 def calc_delta_seconds(val: int, unit: str) -> int:
@@ -43,6 +47,36 @@ def calc_delta_seconds(val: int, unit: str) -> int:
         'months': 2592000
     }
     return val * mapping.get(unit, 0)
+
+
+def compute_next_run_after(prev_run_str: str, val: int, unit: str) -> str:
+    """
+    Рассчитывает следующую дату списания строго по расписанию (без сдвига времени),
+    но если бот долго был выключен — гарантирует, что следующая дата будет в будущем.
+    """
+    now = get_msk_now().replace(microsecond=0)
+    delta_sec = max(1, calc_delta_seconds(val, unit))
+    delta = datetime.timedelta(seconds=delta_sec)
+
+    try:
+        prev_dt = datetime.datetime.strptime(prev_run_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK_TZ)
+        next_dt = prev_dt + delta
+        if next_dt <= now:
+            # Если пропущено несколько циклов во время рестарта — прыгаем к ближайшему будущему слоту по сетке
+            missed_steps = int((now - prev_dt).total_seconds() // delta_sec) + 1
+            next_dt = prev_dt + datetime.timedelta(seconds=missed_steps * delta_sec)
+    except ValueError:
+        next_dt = now + delta
+
+    return next_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sanitize_csv_cell(val) -> str:
+    """Защита от CSV-инъекций (Formula Injection в Excel)"""
+    s = "" if val is None else str(val)
+    if s and s[0] in ('=', '+', '-', '@'):
+        return f"'{s}"
+    return s
 
 
 UNIT_LABELS = {
@@ -63,8 +97,101 @@ TX_TYPE_LABELS = {
 }
 
 
+def parse_first_run_datetime(
+    date_str: str,
+    time_str: str
+) -> tuple[datetime.datetime | None, str | None, bool]:
+    """
+    Рассчитывает дату и время первого списания по МСК.
+    Возвращает: (target_datetime, error_message, shifted_to_tomorrow)
+    """
+    now = get_msk_now().replace(microsecond=0)
+    date_str = date_str.strip()
+    time_str = time_str.strip()
+    shifted_tomorrow = False
+
+    # 1. Если ОБА поля пустые -> берем текущую дату и текущее время (списание начнется сразу)
+    if not date_str and not time_str:
+        return now, None, False
+
+    # 2. Разбираем дату (если указана)
+    parsed_date: datetime.date | None = None
+    if date_str:
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                parsed_date = datetime.datetime.strptime(date_str, fmt).date()
+                break
+            except ValueError:
+                continue
+        if parsed_date is None:
+            return (
+                None,
+                "❌ Неверный формат даты! Используйте `ДД.ММ.ГГГГ` (например, `25.10.2026`) или `ГГГГ-ММ-ДД`.",
+                False
+            )
+
+        if parsed_date < now.date():
+            return None, "❌ Нельзя указать дату, которая уже прошла!", False
+        if parsed_date > now.date() + datetime.timedelta(days=3650):
+            return None, "❌ Дата слишком далеко в будущем (максимум 10 лет)!", False
+
+    # 3. Разбираем время (если указано)
+    parsed_time: datetime.time | None = None
+    if time_str:
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                parsed_time = datetime.datetime.strptime(time_str, fmt).time()
+                break
+            except ValueError:
+                continue
+        if parsed_time is None:
+            return (
+                None,
+                "❌ Неверный формат времени! Используйте `ЧЧ:ММ` (например, `18:30`) или `ЧЧ:ММ:СС`.",
+                False
+            )
+
+    # 4. Комбинируем дату и время по правилам:
+    # Случай А: Дата ПУСТАЯ, а Время УКАЗАНО
+    if parsed_date is None and parsed_time is not None:
+        candidate = datetime.datetime.combine(
+            now.date(),
+            parsed_time,
+            tzinfo=MSK_TZ
+        )
+        # Если указанное время сегодня уже прошло -> автоматом переносим на завтра
+        if candidate <= now:
+            candidate += datetime.timedelta(days=1)
+            shifted_tomorrow = True
+        return candidate, None, shifted_tomorrow
+
+    # Случай Б: Дата УКАЗАНА, а Время ПУСТОЕ -> ставим указанную дату и текущее время
+    if parsed_date is not None and parsed_time is None:
+        candidate = datetime.datetime.combine(
+            parsed_date,
+            now.time(),
+            tzinfo=MSK_TZ
+        )
+        return candidate, None, False
+
+    # Случай В: И Дата, и Время УКАЗАНЫ явно
+    candidate = datetime.datetime.combine(
+        parsed_date,
+        parsed_time,
+        tzinfo=MSK_TZ
+    )
+    if candidate < now:
+        return (
+            None,
+            "❌ Указанное время сегодня уже прошло! Оставьте поле даты пустым (для автопереноса на завтра) или укажите будущее время.",
+            False
+        )
+
+    return candidate, None, False
+
+
 def check_is_admin(interaction: discord.Interaction) -> bool:
-    if not interaction.guild:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
     if interaction.user.id == interaction.guild.owner_id:
         return True
@@ -72,7 +199,7 @@ def check_is_admin(interaction: discord.Interaction) -> bool:
 
 
 def check_is_leader(interaction: discord.Interaction) -> bool:
-    if not interaction.guild:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
     if interaction.user.id == interaction.guild.owner_id:
         return True
@@ -208,51 +335,56 @@ async def add_notification(user_id: int, message: str):
 
 @tasks.loop(seconds=10)
 async def auto_payment_task():
-    now_str = get_msk_now().strftime("%Y-%m-%d %H:%M:%S")
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT * FROM auto_payments WHERE is_active = 1 AND next_run <= ?",
-            (now_str,)
-        ) as cursor:
-            payments = await cursor.fetchall()
+    try:
+        now_str = get_msk_now().strftime("%Y-%m-%d %H:%M:%S")
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT * FROM auto_payments WHERE is_active = 1 AND next_run <= ?",
+                (now_str,)
+            ) as cursor:
+                payments = await cursor.fetchall()
 
-        for p in payments:
-            pay_id, owner_did, s_acc, r_acc, amount, i_val, i_unit, next_run_str, is_active = p
+            for p in payments:
+                pay_id, owner_did, s_acc, r_acc, amount, i_val, i_unit, next_run_str, is_active = p
 
-            if amount <= 0 or s_acc == r_acc:
-                await db.execute('UPDATE auto_payments SET is_active = 0 WHERE id = ?', (pay_id,))
-                continue
-
-            async with db.execute('SELECT balance FROM users WHERE account_id = ?', (s_acc,)) as cur:
-                row = await cur.fetchone()
-                if not row or row[0] < amount:
+                if amount <= 0 or s_acc == r_acc:
+                    await db.execute('UPDATE auto_payments SET is_active = 0 WHERE id = ?', (pay_id,))
                     continue
 
-            async with db.execute('SELECT balance, discord_id FROM users WHERE account_id = ?', (r_acc,)) as cur:
-                r_row = await cur.fetchone()
-                if not r_row:
+                # Атомарное списание: баланс уменьшается ТОЛЬКО если на счете сейчас достаточно средств
+                cur_deduct = await db.execute(
+                    'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                    (amount, s_acc, amount)
+                )
+                if cur_deduct.rowcount == 0:
+                    # Недостаточно средств или счет отправителя не найден — пропускаем до пополнения
                     continue
 
-                new_s_bal = row[0] - amount
-                new_r_bal = r_row[0] + amount
-                r_owner_id = r_row[1]
+                async with db.execute('SELECT discord_id FROM users WHERE account_id = ?', (r_acc,)) as cur:
+                    r_row = await cur.fetchone()
+                    if not r_row:
+                        # Возвращаем средства отправителю, если счет получателя удален
+                        await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, s_acc))
+                        await db.execute('UPDATE auto_payments SET is_active = 0 WHERE id = ?', (pay_id,))
+                        continue
+                    r_owner_id = r_row[0]
 
-                await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (new_s_bal, s_acc))
-                await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (new_r_bal, r_acc))
+                await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, r_acc))
                 await log_transaction(db, 'auto_transfer', s_acc, r_acc, amount)
 
                 await add_notification(owner_did, f"✅ Автоплатеж **{amount}** на `{r_acc}` выполнен.")
                 if r_owner_id:
                     await add_notification(r_owner_id, f"💰 Получен автоплатеж **{amount}** от `{s_acc}`.")
 
-                delta = calc_delta_seconds(i_val, i_unit)
-                next_dt = get_msk_now() + datetime.timedelta(seconds=delta)
+                new_next_run = compute_next_run_after(next_run_str, i_val, i_unit)
                 await db.execute(
                     'UPDATE auto_payments SET next_run = ? WHERE id = ?',
-                    (next_dt.strftime("%Y-%m-%d %H:%M:%S"), pay_id)
+                    (new_next_run, pay_id)
                 )
 
-        await db.commit()
+            await db.commit()
+    except Exception as e:
+        print(f"[Ошибка в auto_payment_task]: {e}")
 
 
 @auto_payment_task.before_loop
@@ -279,6 +411,10 @@ class CreateAccountModal(Modal, title="Создание банковского �
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if not check_is_admin(interaction):
+            await interaction.followup.send("❌ У вас нет прав администратора!", ephemeral=True)
+            return
+
         acc_id = self.account_id.value.strip()
         if not acc_id.isdigit() or len(acc_id) != 10:
             await interaction.followup.send("❌ ID счета должен состоять ровно из 10 цифр!", ephemeral=True)
@@ -334,6 +470,10 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if not check_is_admin(interaction):
+            await interaction.followup.send("❌ У вас нет прав администратора!", ephemeral=True)
+            return
+
         try:
             amount = int(self.amount_input.value.strip())
         except ValueError:
@@ -342,6 +482,10 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
 
         if (self.action_type in ("add", "remove") and amount <= 0) or (self.action_type == "set" and amount < 0):
             await interaction.followup.send("❌ Указана некорректная сумма!", ephemeral=True)
+            return
+
+        if amount > MAX_AMOUNT:
+            await interaction.followup.send(f"❌ Сумма превышает максимально допустимый лимит ({MAX_AMOUNT:,})!", ephemeral=True)
             return
 
         acc_id = self.prefill_account or self.account_input.value.strip()
@@ -357,29 +501,34 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
                     return
 
                 current_bal, target_did, game_nick = row
-                new_bal = current_bal
 
                 if self.action_type == "add":
-                    new_bal += amount
+                    await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, acc_id))
                     await log_transaction(db, "admin_deposit", None, acc_id, amount)
                     await add_notification(target_did, f"💰 Зачисление от банка: **+{amount}**.")
                 elif self.action_type == "remove":
-                    if current_bal < amount:
+                    cur_rem = await db.execute(
+                        'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                        (amount, acc_id, amount)
+                    )
+                    if cur_rem.rowcount == 0:
                         await interaction.followup.send(
                             f"❌ Недостаточно средств на счете (доступно: **{current_bal}**).",
                             ephemeral=True
                         )
                         return
-                    new_bal -= amount
                     await log_transaction(db, "admin_withdraw", acc_id, None, amount)
                     await add_notification(target_did, f"📉 Списание банком: **-{amount}**.")
                 elif self.action_type == "set":
-                    new_bal = amount
+                    await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (amount, acc_id))
                     await log_transaction(db, "admin_set", acc_id, acc_id, amount)
                     await add_notification(target_did, f"⚙️ Ваш баланс установлен на **{amount}**.")
 
-                await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (new_bal, acc_id))
                 await db.commit()
+
+                async with db.execute('SELECT balance FROM users WHERE account_id = ?', (acc_id,)) as cur_new:
+                    new_bal_row = await cur_new.fetchone()
+                    new_bal = new_bal_row[0] if new_bal_row else 0
 
         action_names = {"add": "Зачислено", "remove": "Списано", "set": "Установлен баланс"}
         await interaction.followup.send(
@@ -423,8 +572,8 @@ class TransferModal(Modal, title="Перевод средств"):
             await interaction.followup.send("❌ Сумма должна быть числом!", ephemeral=True)
             return
 
-        if amount <= 0:
-            await interaction.followup.send("❌ Сумма перевода должна быть больше нуля!", ephemeral=True)
+        if amount <= 0 or amount > MAX_AMOUNT:
+            await interaction.followup.send("❌ Сумма перевода должна быть больше нуля и в пределах лимита!", ephemeral=True)
             return
 
         if not target_acc.isdigit() or len(target_acc) != 10:
@@ -444,27 +593,32 @@ class TransferModal(Modal, title="Перевод средств"):
                 await interaction.followup.send("❌ Нельзя перевести средства самому себе!", ephemeral=True)
                 return
 
-            if sender_bal < amount:
+            async with db.execute('SELECT discord_id, game_nick FROM users WHERE account_id = ?', (target_acc,)) as cursor:
+                recv = await cursor.fetchone()
+                if not recv:
+                    await interaction.followup.send("❌ Счет получателя не найден!", ephemeral=True)
+                    return
+                recv_did, recv_nick = recv
+
+            # Атомарное списание (защита от двойного клика / Race Condition)
+            cur_deduct = await db.execute(
+                'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                (amount, sender_acc, amount)
+            )
+            if cur_deduct.rowcount == 0:
                 await interaction.followup.send(
                     f"❌ Недостаточно средств! Ваш баланс: **{sender_bal}**",
                     ephemeral=True
                 )
                 return
 
-            async with db.execute('SELECT balance, discord_id, game_nick FROM users WHERE account_id = ?', (target_acc,)) as cursor:
-                recv = await cursor.fetchone()
-                if not recv:
-                    await interaction.followup.send("❌ Счет получателя не найден!", ephemeral=True)
-                    return
+            await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, target_acc))
+            await log_transaction(db, 'user_transfer', sender_acc, target_acc, amount)
+            await db.commit()
 
-                recv_bal, recv_did, recv_nick = recv
-                new_s_bal = sender_bal - amount
-                new_r_bal = recv_bal + amount
-
-                await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (new_s_bal, sender_acc))
-                await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (new_r_bal, target_acc))
-                await log_transaction(db, 'user_transfer', sender_acc, target_acc, amount)
-                await db.commit()
+            async with db.execute('SELECT balance FROM users WHERE account_id = ?', (sender_acc,)) as cur_b:
+                b_row = await cur_b.fetchone()
+                new_s_bal = b_row[0] if b_row else (sender_bal - amount)
 
         await add_notification(sender_id, f"💸 Перевод **{amount}** на счет `{target_acc}` ({recv_nick}).")
         await add_notification(recv_did, f"💰 Получен перевод **{amount}** от `{sender_acc}` ({sender_nick}).")
@@ -477,7 +631,13 @@ class TransferModal(Modal, title="Перевод средств"):
 
 
 class AutoPaymentStepModal(Modal, title="Параметры автоплатежа"):
-    def __init__(self, unit: str, unit_label: str):
+    def __init__(
+        self,
+        unit: str,
+        unit_label: str,
+        prefill_date: str = "",
+        prefill_time: str = ""
+    ):
         super().__init__()
         self.unit = unit
         self.unit_label = unit_label
@@ -501,9 +661,26 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
             required=True,
             max_length=6
         )
+        self.start_date = TextInput(
+            label="Дата 1-го списания (пусто = сегодня)",
+            placeholder="ДД.ММ.ГГГГ или ГГГГ-ММ-ДД (необязательно)",
+            default=prefill_date,
+            required=False,
+            max_length=10
+        )
+        self.start_time = TextInput(
+            label="Время 1-го списания по МСК (пусто = сейчас)",
+            placeholder="ЧЧ:ММ (если прошло сегодня — перенесется на завтра)",
+            default=prefill_time,
+            required=False,
+            max_length=8
+        )
+
         self.add_item(self.receiver_acc)
         self.add_item(self.amount)
         self.add_item(self.interval_val)
+        self.add_item(self.start_date)
+        self.add_item(self.start_time)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -536,13 +713,19 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
             await interaction.followup.send("❌ Сумма и интервал должны быть целыми числами!", ephemeral=True)
             return
 
-        if amount <= 0 or val <= 0:
-            await interaction.followup.send("❌ Сумма и интервал должны быть больше 0!", ephemeral=True)
+        if amount <= 0 or amount > MAX_AMOUNT or val <= 0 or val > 10000:
+            await interaction.followup.send("❌ Сумма и интервал должны быть больше 0 и в пределах допустимых лимитов!", ephemeral=True)
             return
 
-        delta = calc_delta_seconds(val, self.unit)
-        next_dt = get_msk_now() + datetime.timedelta(seconds=delta)
-        next_run_str = next_dt.strftime("%Y-%m-%d %H:%M:%S")
+        first_dt, err_msg, shifted_tomorrow = parse_first_run_datetime(
+            self.start_date.value,
+            self.start_time.value
+        )
+        if err_msg or first_dt is None:
+            await interaction.followup.send(err_msg or "❌ Ошибка даты/времени.", ephemeral=True)
+            return
+
+        next_run_str = first_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
@@ -556,10 +739,17 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
             ) as cur:
                 payments = await cur.fetchall()
 
+        note = ""
+        if shifted_tomorrow:
+            note = "\nℹ️ *Указанное время сегодня уже прошло, поэтому первое списание автоматически назначено на завтра.*"
+
         embed = build_autopayments_embed(payments)
         await safe_edit_or_send(
             interaction,
-            content=f"✅ Автоплатеж на `{r_acc}` (**{amount}** каждые **{val} {self.unit_label}**) создан!",
+            content=(
+                f"✅ Автоплатеж на `{r_acc}` (**{amount}** каждые **{val} {self.unit_label}**) создан!\n"
+                f"🗓️ Первое списание: `{next_run_str}` (МСК){note}"
+            ),
             embed=embed,
             view=AutoPaymentsListView(user_data, payments)
         )
@@ -828,7 +1018,7 @@ class TransactionPaginationView(View):
         writer = csv.writer(output)
         writer.writerow(["ID", "Дата (МСК)", "Тип", "Отправитель", "Получатель", "Сумма"])
         for tx in self.full_data:
-            writer.writerow(tx)
+            writer.writerow([sanitize_csv_cell(col) for col in tx])
         file = discord.File(
             fp=io.BytesIO(output.getvalue().encode('utf-8-sig')),
             filename="transactions.csv"
@@ -916,12 +1106,180 @@ class NotificationsView(View):
         )
 
 
+class AutoPaymentBuilderView(View):
+    """Мини-календарь и выбор времени в GUI перед открытием модального окна автоплатежа"""
+    def __init__(self, user_data, unit: str, unit_label: str):
+        super().__init__(timeout=300)
+        self.user_data = user_data
+        self.unit = unit
+        self.unit_label = unit_label
+        self.selected_date: str = ""  # пусто = сегодня
+        self.selected_time: str = ""  # пусто = сейчас
+
+        now = get_msk_now()
+
+        # Select 1: Мини-календарь на 14 дней вперед
+        date_options = [
+            discord.SelectOption(
+                label="Авто (Сегодня / Завтра если время прошло)",
+                description=f"По умолчанию ({now.strftime('%d.%m.%Y')})",
+                value="today_auto",
+                emoji="📅",
+                default=True
+            )
+        ]
+        for i in range(0, 14):
+            d = now.date() + datetime.timedelta(days=i)
+            wd = RU_WEEKDAYS[d.weekday()]
+            d_str = d.strftime("%d.%m.%Y")
+            if i == 0:
+                lbl = f"Сегодня — {d_str} ({wd})"
+            elif i == 1:
+                lbl = f"Завтра — {d_str} ({wd})"
+            elif i == 2:
+                lbl = f"Послезавтра — {d_str} ({wd})"
+            else:
+                lbl = f"{d_str} ({wd})"
+            date_options.append(
+                discord.SelectOption(
+                    label=lbl,
+                    value=d_str,
+                    emoji="🗓️"
+                )
+            )
+        date_options.append(
+            discord.SelectOption(
+                label="Ввести другую дату вручную...",
+                description="Вы сможете вписать любую дату в следующем окне",
+                value="manual",
+                emoji="⌨️"
+            )
+        )
+
+        self.date_select = Select(
+            placeholder="📅 Выберите дату первого списания...",
+            options=date_options,
+            row=0
+        )
+        self.date_select.callback = self.on_date_change
+        self.add_item(self.date_select)
+
+        # Select 2: Быстрый выбор времени (МСК)
+        time_slots = [
+            ("Сейчас (текущее время)", "", "⚡"),
+            ("00:00 (Полночь)", "00:00", "🕛"),
+            ("06:00 (Утро)", "06:00", "🌅"),
+            ("09:00", "09:00", "🕘"),
+            ("10:00", "10:00", "🕙"),
+            ("12:00 (Полдень)", "12:00", "🕛"),
+            ("14:00", "14:00", "🕑"),
+            ("15:00", "15:00", "🕒"),
+            ("16:00", "16:00", "🕓"),
+            ("18:00 (Вечер)", "18:00", "🕕"),
+            ("19:00", "19:00", "🕖"),
+            ("20:00", "20:00", "🕗"),
+            ("21:00", "21:00", "🕘"),
+            ("22:00", "22:00", "🕙"),
+            ("23:00", "23:00", "🕚"),
+            ("Ввести точное время вручную (ЧЧ:ММ)...", "manual", "⌨️"),
+        ]
+        time_options = [
+            discord.SelectOption(
+                label=lbl,
+                value=val if val else "now",
+                emoji=emj,
+                default=(val == "")
+            )
+            for lbl, val, emj in time_slots
+        ]
+
+        self.time_select = Select(
+            placeholder="🕒 Выберите время первого списания (МСК)...",
+            options=time_options,
+            row=1
+        )
+        self.time_select.callback = self.on_time_change
+        self.add_item(self.time_select)
+
+    def build_embed(self) -> discord.Embed:
+        now = get_msk_now()
+        d_display = self.selected_date if self.selected_date else f"Сегодня ({now.strftime('%d.%m.%Y')}) / Авто"
+        t_display = self.selected_time if self.selected_time else f"Сейчас ({now.strftime('%H:%M')} МСК)"
+
+        embed = discord.Embed(
+            title=f"🗓️ Настройка автоплатежа (Интервал: в {self.unit_label})",
+            description=(
+                "Выберите **дату** и **время** первого списания в списках ниже (или оставьте по умолчанию), "
+                "затем нажмите зеленую кнопку **«Ввести счет и сумму»**.\n\n"
+                "💡 *В открывшемся окне вы также сможете подкорректировать дату и время вручную или оставить их пустыми.*"
+            ),
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="⏱️ Единица интервала", value=f"Каждые **N {self.unit_label}**", inline=True)
+        embed.add_field(name="📅 Дата 1-го списания", value=f"`{d_display}`", inline=True)
+        embed.add_field(name="🕒 Время 1-го списания", value=f"`{t_display}`", inline=True)
+        return embed
+
+    async def on_date_change(self, interaction: discord.Interaction):
+        val = self.date_select.values[0]
+        if val in ("today_auto", "manual"):
+            self.selected_date = ""
+        else:
+            self.selected_date = val
+
+        for opt in self.date_select.options:
+            opt.default = (opt.value == val)
+
+        await safe_edit_or_send(interaction, content=None, embed=self.build_embed(), view=self)
+
+    async def on_time_change(self, interaction: discord.Interaction):
+        val = self.time_select.values[0]
+        if val in ("now", "manual"):
+            self.selected_time = ""
+        else:
+            self.selected_time = val
+
+        for opt in self.time_select.options:
+            opt.default = (opt.value == val)
+
+        await safe_edit_or_send(interaction, content=None, embed=self.build_embed(), view=self)
+
+    @button(label="✍️ Ввести счет и сумму", style=ButtonStyle.green, row=2)
+    async def open_modal_btn(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(
+            AutoPaymentStepModal(
+                self.unit,
+                self.unit_label,
+                prefill_date=self.selected_date,
+                prefill_time=self.selected_time
+            )
+        )
+
+    @button(label="🔙 Назад к автоплатежам", style=ButtonStyle.red, row=2)
+    async def back_to_list_btn(self, interaction: discord.Interaction, button: Button):
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
+                (self.user_data[0],)
+            ) as cur:
+                payments = await cur.fetchall()
+
+        embed = build_autopayments_embed(payments)
+        await safe_edit_or_send(
+            interaction,
+            content=None,
+            embed=embed,
+            view=AutoPaymentsListView(self.user_data, payments)
+        )
+
+
 class AutoPaymentsListView(View):
     def __init__(self, user_data, payments_list):
         super().__init__(timeout=300)
         self.user_data = user_data
         self.payments = payments_list
 
+        # Выпадающий список для СОЗДАНИЯ автоплатежа (выбор единицы времени -> переход в календарик)
         unit_select = Select(
             placeholder="➕ Создать автоплатеж: выберите периодичность...",
             options=[
@@ -937,6 +1295,7 @@ class AutoPaymentsListView(View):
         unit_select.callback = self.create_unit_selected
         self.add_item(unit_select)
 
+        # Выпадающий список для УДАЛЕНИЯ (если есть платежи)
         if payments_list:
             options = []
             for p in payments_list[:25]:
@@ -960,7 +1319,13 @@ class AutoPaymentsListView(View):
     async def create_unit_selected(self, interaction: discord.Interaction):
         unit = interaction.data['values'][0]
         unit_label = UNIT_LABELS.get(unit, unit)
-        await interaction.response.send_modal(AutoPaymentStepModal(unit, unit_label))
+        builder_view = AutoPaymentBuilderView(self.user_data, unit, unit_label)
+        await safe_edit_or_send(
+            interaction,
+            content=None,
+            embed=builder_view.build_embed(),
+            view=builder_view
+        )
 
     async def back_callback(self, interaction: discord.Interaction):
         fresh_data = await get_user_data(self.user_data[0]) or self.user_data
@@ -1178,18 +1543,30 @@ class AdminUserManageView(View):
 
     @button(label="➕ Зачислить", style=ButtonStyle.green, row=0)
     async def add_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            return
         await interaction.response.send_modal(ManageBalanceModal("add", prefill_account=self.u_data[3]))
 
     @button(label="➖ Списать", style=ButtonStyle.red, row=0)
     async def remove_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            return
         await interaction.response.send_modal(ManageBalanceModal("remove", prefill_account=self.u_data[3]))
 
     @button(label="⚙️ Установить", style=ButtonStyle.blurple, row=0)
     async def set_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            return
         await interaction.response.send_modal(ManageBalanceModal("set", prefill_account=self.u_data[3]))
 
     @button(label="📜 Транзакции игрока", style=ButtonStyle.secondary, row=1)
     async def user_tx_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            return
         await interaction.response.defer()
         acc = self.u_data[3]
         async with aiosqlite.connect(DB_NAME) as db:
@@ -1206,6 +1583,9 @@ class AdminUserManageView(View):
 
     @button(label="🔙 В админ-панель", style=ButtonStyle.gray, row=1)
     async def back_admin_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            return
         embed = discord.Embed(
             title="🛡️ Панель Администратора",
             description="Выберите действие или найдите игрока в списке ниже.",
@@ -1227,11 +1607,17 @@ class AdminSearchModal(Modal, title="Поиск счета / игрока"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
+        if not check_is_admin(interaction):
+            await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            return
         q = self.query_input.value.strip()
+        # Экранирование спецсимволов SQL LIKE (% и _)
+        q_escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_pattern = f"%{q_escaped}%"
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute(
-                "SELECT * FROM users WHERE account_id LIKE ? OR game_nick LIKE ? OR discord_tag LIKE ? LIMIT 25",
-                (f"%{q}%", f"%{q}%", f"%{q}%")
+                "SELECT * FROM users WHERE account_id LIKE ? ESCAPE '\\' OR game_nick LIKE ? ESCAPE '\\' OR discord_tag LIKE ? ESCAPE '\\' LIMIT 25",
+                (like_pattern, like_pattern, like_pattern)
             ) as cur:
                 rows = await cur.fetchall()
 
@@ -1434,9 +1820,9 @@ async def admin_set_cmd(interaction: discord.Interaction, user: discord.Member):
 @admin_set_cmd.error
 async def admin_error_handler(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.CheckFailure):
-        await interaction.response.send_message("❌ У вас нет прав для выполнения этой команды.", ephemeral=True)
+        await safe_edit_or_send(interaction, content="❌ У вас нет прав для выполнения этой команды.")
     else:
-        await interaction.response.send_message(f"❌ Произошла ошибка: {error}", ephemeral=True)
+        await safe_edit_or_send(interaction, content=f"❌ Произошла ошибка: {error}")
 
 
 if __name__ == "__main__":
