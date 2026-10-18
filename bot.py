@@ -6,6 +6,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import aiosqlite
 import datetime
+import asyncio
 import io
 import csv
 
@@ -28,6 +29,11 @@ user_notifications = {}
 
 RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3), name="MSK")
+
+# Постоянное подключение к БД и блокировка записи для мгновенного отклика без создания потоков на каждый клик
+_db_conn: aiosqlite.Connection | None = None
+_db_init_lock = asyncio.Lock()
+db_write_lock = asyncio.Lock()
 
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -62,7 +68,6 @@ def compute_next_run_after(prev_run_str: str, val: int, unit: str) -> str:
         prev_dt = datetime.datetime.strptime(prev_run_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK_TZ)
         next_dt = prev_dt + delta
         if next_dt <= now:
-            # Если пропущено несколько циклов во время рестарта — прыгаем к ближайшему будущему слоту по сетке
             missed_steps = int((now - prev_dt).total_seconds() // delta_sec) + 1
             next_dt = prev_dt + datetime.timedelta(seconds=missed_steps * delta_sec)
     except ValueError:
@@ -159,7 +164,6 @@ def parse_first_run_datetime(
             parsed_time,
             tzinfo=MSK_TZ
         )
-        # Если указанное время сегодня уже прошло -> автоматом переносим на завтра
         if candidate <= now:
             candidate += datetime.timedelta(days=1)
             shifted_tomorrow = True
@@ -216,6 +220,42 @@ def build_profile_embed(user_data) -> discord.Embed:
     return embed
 
 
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False) -> bool:
+    """
+    Мгновенно подтверждает получение интеракции Discord, чтобы таймер 3 секунд не истек
+    во время работы с базой данных. Возвращает False, если пакет шел до бота дольше 3 секунд.
+    """
+    if interaction.response.is_done():
+        return True
+    try:
+        if ephemeral:
+            await interaction.response.defer(ephemeral=True)
+        else:
+            await interaction.response.defer()
+        return True
+    except discord.NotFound:
+        print(f"[WARN] Интеракция {interaction.id} истекла (задержка сети/ПК > 3 сек).")
+        return False
+    except discord.HTTPException as e:
+        if e.code == 40060:  # Уже подтверждена
+            return True
+        print(f"[WARN] Ошибка HTTP при defer интеракции {interaction.id}: {e}")
+        return False
+
+
+async def safe_send_modal(interaction: discord.Interaction, modal: Modal) -> bool:
+    """Безопасное открытие модального окна с защитой от ошибки 10062."""
+    try:
+        await interaction.response.send_modal(modal)
+        return True
+    except discord.NotFound:
+        print(f"[WARN] Не удалось открыть модальное окно: интеракция {interaction.id} истекла (> 3 сек).")
+        return False
+    except discord.HTTPException as e:
+        print(f"[WARN] Ошибка HTTP при открытии модального окна: {e}")
+        return False
+
+
 async def safe_edit_or_send(
     interaction: discord.Interaction,
     content: str | None = None,
@@ -224,7 +264,8 @@ async def safe_edit_or_send(
 ):
     """Безопасное обновление сообщения из модалки/кнопки с защитой от ошибки 10062 (Unknown interaction)"""
     kwargs = {}
-    if content is not None:
+    if content is not None or interaction.response.is_done():
+        # При редактировании передаем content (даже если он None, чтобы очистить старый текст)
         kwargs["content"] = content
     if embed is not None:
         kwargs["embed"] = embed
@@ -238,80 +279,112 @@ async def safe_edit_or_send(
             await interaction.edit_original_response(**kwargs)
     except discord.NotFound:
         try:
+            send_kwargs = {k: v for k, v in kwargs.items() if v is not None}
             if not interaction.response.is_done():
-                await interaction.response.send_message(**kwargs, ephemeral=True)
+                await interaction.response.send_message(**send_kwargs, ephemeral=True)
             else:
-                await interaction.followup.send(**kwargs, ephemeral=True)
-        except discord.HTTPException:
-            pass
+                await interaction.followup.send(**send_kwargs, ephemeral=True)
+        except discord.HTTPException as e:
+            print(f"[WARN] Не удалось обновить/отправить сообщение для интеракции {interaction.id}: {e}")
+    except discord.HTTPException as e:
+        print(f"[WARN] Ошибка HTTP при обновлении сообщения {interaction.id}: {e}")
 
 
-# --- БАЗА ДАННЫХ ---
+# --- БАЗА ДАННЫХ (ЕДИНОЕ ПОСТОЯННОЕ ПОДКЛЮЧЕНИЕ В ПАМЯТИ) ---
+
+async def get_db() -> aiosqlite.Connection:
+    """
+    Возвращает единое постоянное соединение с SQLite.
+    Исключает создание нового потока Windows и переоткрытие файла при каждом клике.
+    """
+    global _db_conn
+    if _db_conn is not None:
+        return _db_conn
+
+    async with _db_init_lock:
+        if _db_conn is None:
+            conn = await aiosqlite.connect(DB_NAME)
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute("PRAGMA busy_timeout=5000")
+            await conn.execute("PRAGMA cache_size=-16000")
+
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    discord_id INTEGER PRIMARY KEY,
+                    discord_tag TEXT,
+                    game_nick TEXT,
+                    account_id TEXT UNIQUE,
+                    balance INTEGER DEFAULT 0,
+                    faction_prefix TEXT
+                )
+            ''')
+
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    sender_acc TEXT,
+                    receiver_acc TEXT,
+                    amount INTEGER NOT NULL
+                )
+            ''')
+
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS auto_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_did INTEGER,
+                    sender_acc TEXT,
+                    receiver_acc TEXT,
+                    amount INTEGER,
+                    interval_val INTEGER,
+                    interval_unit TEXT,
+                    next_run TEXT,
+                    is_active INTEGER DEFAULT 1
+                )
+            ''')
+
+            # Индексы для мгновенного поиска без полного сканирования таблиц
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_account ON users(account_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_faction ON users(faction_prefix)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_sender ON transactions(sender_acc)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_receiver ON transactions(receiver_acc)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions(created_at)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_ap_active_next ON auto_payments(is_active, next_run)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_ap_owner ON auto_payments(owner_did)")
+
+            await conn.commit()
+            _db_conn = conn
+    return _db_conn
+
 
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                discord_id INTEGER PRIMARY KEY,
-                discord_tag TEXT,
-                game_nick TEXT,
-                account_id TEXT UNIQUE,
-                balance INTEGER DEFAULT 0,
-                faction_prefix TEXT
-            )
-        ''')
-
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                type TEXT NOT NULL,
-                sender_acc TEXT,
-                receiver_acc TEXT,
-                amount INTEGER NOT NULL
-            )
-        ''')
-
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS auto_payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_did INTEGER,
-                sender_acc TEXT,
-                receiver_acc TEXT,
-                amount INTEGER,
-                interval_val INTEGER,
-                interval_unit TEXT,
-                next_run TEXT,
-                is_active INTEGER DEFAULT 1
-            )
-        ''')
-
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.commit()
+    await get_db()
 
 
 async def get_user_data(discord_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute('SELECT * FROM users WHERE discord_id = ?', (discord_id,)) as cursor:
-            return await cursor.fetchone()
+    db = await get_db()
+    async with db.execute('SELECT * FROM users WHERE discord_id = ?', (discord_id,)) as cursor:
+        return await cursor.fetchone()
 
 
 async def get_user_by_account(account_id: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute('SELECT * FROM users WHERE account_id = ?', (account_id,)) as cursor:
-            return await cursor.fetchone()
+    db = await get_db()
+    async with db.execute('SELECT * FROM users WHERE account_id = ?', (account_id,)) as cursor:
+        return await cursor.fetchone()
 
 
 async def get_faction_members(prefix: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            'SELECT * FROM users WHERE faction_prefix = ? OR account_id LIKE ?',
-            (prefix, f"{prefix}%")
-        ) as cursor:
-            return await cursor.fetchall()
+    db = await get_db()
+    async with db.execute(
+        'SELECT * FROM users WHERE faction_prefix = ? OR account_id LIKE ?',
+        (prefix, f"{prefix}%")
+    ) as cursor:
+        return await cursor.fetchall()
 
 
-async def log_transaction(db, t_type: str, sender: str | None, receiver: str | None, amount: int):
+async def log_transaction(db: aiosqlite.Connection, t_type: str, sender: str | None, receiver: str | None, amount: int):
     timestamp = get_msk_now().strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
         "INSERT INTO transactions (created_at, type, sender_acc, receiver_acc, amount) VALUES (?, ?, ?, ?, ?)",
@@ -337,12 +410,16 @@ async def add_notification(user_id: int, message: str):
 async def auto_payment_task():
     try:
         now_str = get_msk_now().strftime("%Y-%m-%d %H:%M:%S")
-        async with aiosqlite.connect(DB_NAME) as db:
+        db = await get_db()
+        async with db_write_lock:
             async with db.execute(
                 "SELECT * FROM auto_payments WHERE is_active = 1 AND next_run <= ?",
                 (now_str,)
             ) as cursor:
                 payments = await cursor.fetchall()
+
+            if not payments:
+                return
 
             for p in payments:
                 pay_id, owner_did, s_acc, r_acc, amount, i_val, i_unit, next_run_str, is_active = p
@@ -357,13 +434,11 @@ async def auto_payment_task():
                     (amount, s_acc, amount)
                 )
                 if cur_deduct.rowcount == 0:
-                    # Недостаточно средств или счет отправителя не найден — пропускаем до пополнения
                     continue
 
                 async with db.execute('SELECT discord_id FROM users WHERE account_id = ?', (r_acc,)) as cur:
                     r_row = await cur.fetchone()
                     if not r_row:
-                        # Возвращаем средства отправителю, если счет получателя удален
                         await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, s_acc))
                         await db.execute('UPDATE auto_payments SET is_active = 0 WHERE id = ?', (pay_id,))
                         continue
@@ -410,7 +485,8 @@ class CreateAccountModal(Modal, title="Создание банковского �
         self.add_item(self.account_id)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         if not check_is_admin(interaction):
             await interaction.followup.send("❌ У вас нет прав администратора!", ephemeral=True)
             return
@@ -421,23 +497,26 @@ class CreateAccountModal(Modal, title="Создание банковского �
             return
 
         prefix = acc_id[:2]
-        async with aiosqlite.connect(DB_NAME) as db:
+        db = await get_db()
+        async with db_write_lock:
             try:
                 await db.execute(
                     'INSERT INTO users (discord_id, discord_tag, game_nick, account_id, balance, faction_prefix) VALUES (?, ?, ?, ?, 0, ?)',
                     (self.target_user.id, self.target_user.name, self.game_nick.value.strip(), acc_id, prefix)
                 )
                 await db.commit()
-                await add_notification(self.target_user.id, f"🎉 Вам открыт счет `{acc_id}`!")
-                await interaction.followup.send(
-                    f"✅ Счет `{acc_id}` успешно создан для {self.target_user.mention} (Ник: **{self.game_nick.value.strip()}**, Фракция: `{prefix}`).",
-                    ephemeral=True
-                )
             except aiosqlite.IntegrityError:
                 await interaction.followup.send(
                     "❌ Такой ID счета или пользователь уже зарегистрирован в системе!",
                     ephemeral=True
                 )
+                return
+
+        await add_notification(self.target_user.id, f"🎉 Вам открыт счет `{acc_id}`!")
+        await interaction.followup.send(
+            f"✅ Счет `{acc_id}` успешно создан для {self.target_user.mention} (Ник: **{self.game_nick.value.strip()}**, Фракция: `{prefix}`).",
+            ephemeral=True
+        )
 
 
 class ManageBalanceModal(Modal, title="Операция с балансом"):
@@ -469,7 +548,8 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
             self.add_item(self.account_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         if not check_is_admin(interaction):
             await interaction.followup.send("❌ У вас нет прав администратора!", ephemeral=True)
             return
@@ -493,7 +573,8 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
             await interaction.followup.send("❌ ID счета должен состоять из 10 цифр!", ephemeral=True)
             return
 
-        async with aiosqlite.connect(DB_NAME) as db:
+        db = await get_db()
+        async with db_write_lock:
             async with db.execute('SELECT balance, discord_id, game_nick FROM users WHERE account_id = ?', (acc_id,)) as cursor:
                 row = await cursor.fetchone()
                 if not row:
@@ -562,7 +643,8 @@ class TransferModal(Modal, title="Перевод средств"):
         self.add_item(self.amount)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         sender_id = interaction.user.id
         target_acc = self.prefill_target or self.target_acc.value.strip()
 
@@ -580,7 +662,8 @@ class TransferModal(Modal, title="Перевод средств"):
             await interaction.followup.send("❌ ID счета получателя должен состоять из 10 цифр!", ephemeral=True)
             return
 
-        async with aiosqlite.connect(DB_NAME) as db:
+        db = await get_db()
+        async with db_write_lock:
             async with db.execute('SELECT account_id, balance, game_nick FROM users WHERE discord_id = ?', (sender_id,)) as cur:
                 sender_row = await cur.fetchone()
                 if not sender_row:
@@ -600,7 +683,6 @@ class TransferModal(Modal, title="Перевод средств"):
                     return
                 recv_did, recv_nick = recv
 
-            # Атомарное списание (защита от двойного клика / Race Condition)
             cur_deduct = await db.execute(
                 'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
                 (amount, sender_acc, amount)
@@ -683,7 +765,8 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
         self.add_item(self.start_time)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        if not await safe_defer(interaction):
+            return
         user_id = interaction.user.id
         user_data = await get_user_data(user_id)
         if not user_data:
@@ -727,7 +810,8 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
 
         next_run_str = first_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        async with aiosqlite.connect(DB_NAME) as db:
+        db = await get_db()
+        async with db_write_lock:
             await db.execute(
                 "INSERT INTO auto_payments (owner_did, sender_acc, receiver_acc, amount, interval_val, interval_unit, next_run, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                 (user_id, sender_acc, r_acc, amount, val, self.unit, next_run_str)
@@ -797,7 +881,8 @@ class FilterParamsModal(Modal, title="Дополнительные параме�
         self.add_item(self.tx_id_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        if not await safe_defer(interaction):
+            return
         acc = self.account_input.value.strip()
         self.dashboard.filters["account"] = acc if acc else None
 
@@ -900,6 +985,8 @@ class TransactionFilterDashboardView(View):
         return embed
 
     async def on_type_change(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         val = self.type_select.values[0]
         self.filters["type"] = val
         for opt in self.type_select.options:
@@ -907,6 +994,8 @@ class TransactionFilterDashboardView(View):
         await safe_edit_or_send(interaction, embed=self.build_embed(), view=self)
 
     async def on_period_change(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         val = self.period_select.values[0]
         self.filters["period"] = val
         for opt in self.period_select.options:
@@ -915,10 +1004,12 @@ class TransactionFilterDashboardView(View):
 
     @button(label="⚙️ Счет / Сумма / ID", style=ButtonStyle.secondary, row=2)
     async def params_btn(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_modal(FilterParamsModal(self))
+        await safe_send_modal(interaction, FilterParamsModal(self))
 
     @button(label="🗑️ Сбросить", style=ButtonStyle.gray, row=2)
     async def reset_btn(self, interaction: discord.Interaction, button: Button):
+        if not await safe_defer(interaction):
+            return
         self.filters = {
             "type": "all",
             "period": "all",
@@ -935,7 +1026,8 @@ class TransactionFilterDashboardView(View):
 
     @button(label="🔎 Показать результаты", style=ButtonStyle.green, row=2)
     async def search_btn(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
+        if not await safe_defer(interaction):
+            return
         query = "SELECT * FROM transactions WHERE 1=1"
         params = []
 
@@ -975,9 +1067,9 @@ class TransactionFilterDashboardView(View):
 
         query += " ORDER BY id DESC LIMIT 200"
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute(query, params) as cursor:
-                rows = await cursor.fetchall()
+        db = await get_db()
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
 
         if not rows:
             await interaction.followup.send("❌ По заданным фильтрам транзакций не найдено.", ephemeral=True)
@@ -1001,19 +1093,27 @@ class TransactionPaginationView(View):
 
     @button(label="⬅️", style=ButtonStyle.secondary, row=0)
     async def prev_btn(self, interaction: discord.Interaction, button: Button):
+        if not await safe_defer(interaction):
+            return
         await show_transaction_page(interaction, self.full_data, self.page - 1, self.total, self.dashboard_view)
 
     @button(label="➡️", style=ButtonStyle.secondary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: Button):
+        if not await safe_defer(interaction):
+            return
         await show_transaction_page(interaction, self.full_data, self.page + 1, self.total, self.dashboard_view)
 
     @button(label="🔍 К фильтрам", style=ButtonStyle.primary, row=0)
     async def back_to_filters_btn(self, interaction: discord.Interaction, button: Button):
+        if not await safe_defer(interaction):
+            return
         view = self.dashboard_view or TransactionFilterDashboardView()
         await safe_edit_or_send(interaction, embed=view.build_embed(), view=view)
 
     @button(label="📥 Скачать CSV", style=ButtonStyle.green, row=0)
     async def export_btn(self, interaction: discord.Interaction, button: Button):
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["ID", "Дата (МСК)", "Тип", "Отправитель", "Получатель", "Сумма"])
@@ -1023,7 +1123,7 @@ class TransactionPaginationView(View):
             fp=io.BytesIO(output.getvalue().encode('utf-8-sig')),
             filename="transactions.csv"
         )
-        await interaction.response.send_message("✅ Выгрузка готова:", file=file, ephemeral=True)
+        await interaction.followup.send("✅ Выгрузка готова:", file=file, ephemeral=True)
 
 
 async def show_transaction_page(
@@ -1080,6 +1180,8 @@ class NotificationsView(View):
 
     @button(label="🗑️ Очистить уведомления", style=ButtonStyle.secondary)
     async def clear_btn(self, interaction: discord.Interaction, button: Button):
+        if not await safe_defer(interaction):
+            return
         user_notifications[self.user_id] = []
         user_data = await get_user_data(self.user_id)
         if not user_data:
@@ -1094,6 +1196,8 @@ class NotificationsView(View):
 
     @button(label="🔙 В профиль", style=ButtonStyle.red)
     async def back_btn(self, interaction: discord.Interaction, button: Button):
+        if not await safe_defer(interaction):
+            return
         user_data = await get_user_data(self.user_id)
         if not user_data:
             return
@@ -1221,6 +1325,8 @@ class AutoPaymentBuilderView(View):
         return embed
 
     async def on_date_change(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         val = self.date_select.values[0]
         if val in ("today_auto", "manual"):
             self.selected_date = ""
@@ -1233,6 +1339,8 @@ class AutoPaymentBuilderView(View):
         await safe_edit_or_send(interaction, content=None, embed=self.build_embed(), view=self)
 
     async def on_time_change(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         val = self.time_select.values[0]
         if val in ("now", "manual"):
             self.selected_time = ""
@@ -1246,7 +1354,8 @@ class AutoPaymentBuilderView(View):
 
     @button(label="✍️ Ввести счет и сумму", style=ButtonStyle.green, row=2)
     async def open_modal_btn(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_modal(
+        await safe_send_modal(
+            interaction,
             AutoPaymentStepModal(
                 self.unit,
                 self.unit_label,
@@ -1257,12 +1366,14 @@ class AutoPaymentBuilderView(View):
 
     @button(label="🔙 Назад к автоплатежам", style=ButtonStyle.red, row=2)
     async def back_to_list_btn(self, interaction: discord.Interaction, button: Button):
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute(
-                "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
-                (self.user_data[0],)
-            ) as cur:
-                payments = await cur.fetchall()
+        if not await safe_defer(interaction):
+            return
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
+            (self.user_data[0],)
+        ) as cur:
+            payments = await cur.fetchall()
 
         embed = build_autopayments_embed(payments)
         await safe_edit_or_send(
@@ -1279,7 +1390,6 @@ class AutoPaymentsListView(View):
         self.user_data = user_data
         self.payments = payments_list
 
-        # Выпадающий список для СОЗДАНИЯ автоплатежа (выбор единицы времени -> переход в календарик)
         unit_select = Select(
             placeholder="➕ Создать автоплатеж: выберите периодичность...",
             options=[
@@ -1295,7 +1405,6 @@ class AutoPaymentsListView(View):
         unit_select.callback = self.create_unit_selected
         self.add_item(unit_select)
 
-        # Выпадающий список для УДАЛЕНИЯ (если есть платежи)
         if payments_list:
             options = []
             for p in payments_list[:25]:
@@ -1317,6 +1426,8 @@ class AutoPaymentsListView(View):
         self.add_item(back_btn)
 
     async def create_unit_selected(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         unit = interaction.data['values'][0]
         unit_label = UNIT_LABELS.get(unit, unit)
         builder_view = AutoPaymentBuilderView(self.user_data, unit, unit_label)
@@ -1328,6 +1439,8 @@ class AutoPaymentsListView(View):
         )
 
     async def back_callback(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         fresh_data = await get_user_data(self.user_data[0]) or self.user_data
         is_leader = check_is_leader(interaction)
         await safe_edit_or_send(
@@ -1340,13 +1453,16 @@ class AutoPaymentsListView(View):
     async def delete_callback(self, interaction: discord.Interaction):
         if not interaction.data.get('values'):
             return
+        if not await safe_defer(interaction):
+            return
         try:
             ap_id = int(interaction.data['values'][0])
         except ValueError:
-            await interaction.response.send_message("❌ Ошибка ID.", ephemeral=True)
+            await interaction.followup.send("❌ Ошибка ID.", ephemeral=True)
             return
 
-        async with aiosqlite.connect(DB_NAME) as db:
+        db = await get_db()
+        async with db_write_lock:
             await db.execute("DELETE FROM auto_payments WHERE id = ? AND owner_did = ?", (ap_id, self.user_data[0]))
             await db.commit()
             async with db.execute(
@@ -1400,12 +1516,14 @@ class FactionView(View):
 
     async def quick_transfer_cb(self, interaction: discord.Interaction):
         target_acc = interaction.data['values'][0]
-        await interaction.response.send_modal(TransferModal(prefill_target=target_acc))
+        await safe_send_modal(interaction, TransferModal(prefill_target=target_acc))
 
     async def manual_transfer_cb(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(TransferModal())
+        await safe_send_modal(interaction, TransferModal())
 
     async def back_cb(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         fresh_data = await get_user_data(self.user_data[0]) or self.user_data
         is_leader = check_is_leader(interaction)
         await safe_edit_or_send(
@@ -1446,6 +1564,8 @@ class UserProfileView(View):
         self.add_item(refresh_btn)
 
     async def refresh_callback(self, interaction: discord.Interaction):
+        if not await safe_defer(interaction):
+            return
         fresh_data = await get_user_data(interaction.user.id)
         if not fresh_data:
             return
@@ -1459,15 +1579,17 @@ class UserProfileView(View):
         )
 
     async def transfer_callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(TransferModal())
+        await safe_send_modal(interaction, TransferModal())
 
     async def auto_callback(self, interaction: discord.Interaction):
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute(
-                "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
-                (self.user_data[0],)
-            ) as cur:
-                payments = await cur.fetchall()
+        if not await safe_defer(interaction):
+            return
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
+            (self.user_data[0],)
+        ) as cur:
+            payments = await cur.fetchall()
 
         embed = build_autopayments_embed(payments)
         await safe_edit_or_send(
@@ -1480,7 +1602,12 @@ class UserProfileView(View):
     async def notif_callback(self, interaction: discord.Interaction):
         notes = user_notifications.get(self.user_data[0], [])
         if not notes:
-            await interaction.response.send_message("🔕 У вас пока нет уведомлений.", ephemeral=True)
+            if not await safe_defer(interaction, ephemeral=True):
+                return
+            await interaction.followup.send("🔕 У вас пока нет уведомлений.", ephemeral=True)
+            return
+
+        if not await safe_defer(interaction):
             return
 
         desc = ""
@@ -1502,7 +1629,12 @@ class UserProfileView(View):
 
     async def faction_callback(self, interaction: discord.Interaction):
         if not check_is_leader(interaction):
-            await interaction.response.send_message("❌ Доступ запрещен.", ephemeral=True)
+            if not await safe_defer(interaction, ephemeral=True):
+                return
+            await interaction.followup.send("❌ Доступ запрещен.", ephemeral=True)
+            return
+
+        if not await safe_defer(interaction):
             return
 
         my_prefix = self.user_data[5] if len(self.user_data) > 5 and self.user_data[5] else str(self.user_data[3])[:2]
@@ -1510,7 +1642,7 @@ class UserProfileView(View):
         other_members = [m for m in members if m[0] != self.user_data[0]]
 
         if not other_members:
-            await interaction.response.send_message(f"ℹ️ В вашей фракции (`{my_prefix}`) пока нет других участников.", ephemeral=True)
+            await interaction.followup.send(f"ℹ️ В вашей фракции (`{my_prefix}`) пока нет других участников.", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -1539,42 +1671,47 @@ class AdminUserManageView(View):
     """Карточка управления конкретным игроком в админ-панели (без ручного ввода 10 цифр счета)"""
     def __init__(self, target_user_data):
         super().__init__(timeout=300)
-        self.u_data = target_user_data  # (discord_id, discord_tag, game_nick, account_id, balance, faction_prefix)
+        self.u_data = target_user_data
 
     @button(label="➕ Зачислить", style=ButtonStyle.green, row=0)
     async def add_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.send_modal(ManageBalanceModal("add", prefill_account=self.u_data[3]))
+        await safe_send_modal(interaction, ManageBalanceModal("add", prefill_account=self.u_data[3]))
 
     @button(label="➖ Списать", style=ButtonStyle.red, row=0)
     async def remove_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.send_modal(ManageBalanceModal("remove", prefill_account=self.u_data[3]))
+        await safe_send_modal(interaction, ManageBalanceModal("remove", prefill_account=self.u_data[3]))
 
     @button(label="⚙️ Установить", style=ButtonStyle.blurple, row=0)
     async def set_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.send_modal(ManageBalanceModal("set", prefill_account=self.u_data[3]))
+        await safe_send_modal(interaction, ManageBalanceModal("set", prefill_account=self.u_data[3]))
 
     @button(label="📜 Транзакции игрока", style=ButtonStyle.secondary, row=1)
     async def user_tx_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.defer()
+        if not await safe_defer(interaction):
+            return
         acc = self.u_data[3]
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute(
-                "SELECT * FROM transactions WHERE sender_acc = ? OR receiver_acc = ? ORDER BY id DESC LIMIT 100",
-                (acc, acc)
-            ) as cur:
-                rows = await cur.fetchall()
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM transactions WHERE sender_acc = ? OR receiver_acc = ? ORDER BY id DESC LIMIT 100",
+            (acc, acc)
+        ) as cur:
+            rows = await cur.fetchall()
         if not rows:
             await interaction.followup.send("ℹ️ У этого счета пока нет транзакций.", ephemeral=True)
             return
@@ -1584,7 +1721,10 @@ class AdminUserManageView(View):
     @button(label="🔙 В админ-панель", style=ButtonStyle.gray, row=1)
     async def back_admin_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            return
+        if not await safe_defer(interaction):
             return
         embed = discord.Embed(
             title="🛡️ Панель Администратора",
@@ -1606,20 +1746,20 @@ class AdminSearchModal(Modal, title="Поиск счета / игрока"):
         self.add_item(self.query_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        if not await safe_defer(interaction):
+            return
         if not check_is_admin(interaction):
             await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
         q = self.query_input.value.strip()
-        # Экранирование спецсимволов SQL LIKE (% и _)
         q_escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         like_pattern = f"%{q_escaped}%"
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute(
-                "SELECT * FROM users WHERE account_id LIKE ? ESCAPE '\\' OR game_nick LIKE ? ESCAPE '\\' OR discord_tag LIKE ? ESCAPE '\\' LIMIT 25",
-                (like_pattern, like_pattern, like_pattern)
-            ) as cur:
-                rows = await cur.fetchall()
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM users WHERE account_id LIKE ? ESCAPE '\\' OR game_nick LIKE ? ESCAPE '\\' OR discord_tag LIKE ? ESCAPE '\\' LIMIT 25",
+            (like_pattern, like_pattern, like_pattern)
+        ) as cur:
+            rows = await cur.fetchall()
 
         if not rows:
             await interaction.followup.send(f"❌ По запросу `{q}` никого не найдено.", ephemeral=True)
@@ -1675,33 +1815,40 @@ class AdminPanelView(View):
 
     @classmethod
     async def create(cls):
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT * FROM users ORDER BY balance DESC LIMIT 25") as cur:
-                users = await cur.fetchall()
+        db = await get_db()
+        async with db.execute("SELECT * FROM users ORDER BY balance DESC LIMIT 25") as cur:
+            users = await cur.fetchall()
         return cls(users_list=users)
 
     async def select_user_cb(self, interaction: discord.Interaction):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            return
+        if not await safe_defer(interaction):
             return
         acc_id = interaction.data['values'][0]
         u = await get_user_by_account(acc_id)
         if not u:
-            await interaction.response.send_message("❌ Счет не найден.", ephemeral=True)
+            await interaction.followup.send("❌ Счет не найден.", ephemeral=True)
             return
         await safe_edit_or_send(interaction, embed=build_admin_user_embed(u), view=AdminUserManageView(u))
 
     @button(label="🔎 Поиск игрока", style=ButtonStyle.primary, row=1)
     async def search_user_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.send_modal(AdminSearchModal())
+        await safe_send_modal(interaction, AdminSearchModal())
 
     @button(label="📜 История и фильтры", style=ButtonStyle.blurple, row=1)
     async def history_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            return
+        if not await safe_defer(interaction):
             return
         dashboard = TransactionFilterDashboardView()
         await safe_edit_or_send(interaction, embed=dashboard.build_embed(), view=dashboard)
@@ -1709,31 +1856,34 @@ class AdminPanelView(View):
     @button(label="➕ Зачислить (по ID)", style=ButtonStyle.green, row=2)
     async def add_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.send_modal(ManageBalanceModal("add"))
+        await safe_send_modal(interaction, ManageBalanceModal("add"))
 
     @button(label="➖ Списать (по ID)", style=ButtonStyle.red, row=2)
     async def remove_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.send_modal(ManageBalanceModal("remove"))
+        await safe_send_modal(interaction, ManageBalanceModal("remove"))
 
     @button(label="⚙️ Установить (по ID)", style=ButtonStyle.secondary, row=2)
     async def set_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+            if await safe_defer(interaction, ephemeral=True):
+                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
             return
-        await interaction.response.send_modal(ManageBalanceModal("set"))
+        await safe_send_modal(interaction, ManageBalanceModal("set"))
 
 
 # --- СОБЫТИЯ И КОМАНДЫ ---
 
 @bot.event
 async def on_ready():
-    print(f'Бот запущен: {bot.user}')
     await init_db()
+    print(f'Бот запущен: {bot.user} (БД подключена в памяти)')
     if not auto_payment_task.is_running():
         auto_payment_task.start()
     try:
@@ -1745,12 +1895,14 @@ async def on_ready():
 
 @bot.tree.command(name="start", description="Открыть личный кабинет банка")
 async def start_cmd(interaction: discord.Interaction):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
     user_data = await get_user_data(interaction.user.id)
     if not user_data:
-        await interaction.response.send_message("❌ У вас еще нет банковского счета. Обратитесь к технику.", ephemeral=True)
+        await interaction.followup.send("❌ У вас еще нет банковского счета. Обратитесь к технику.", ephemeral=True)
         return
     is_leader = check_is_leader(interaction)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=build_profile_embed(user_data),
         view=UserProfileView(user_data, is_leader=is_leader),
         ephemeral=True
@@ -1760,13 +1912,15 @@ async def start_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="admin_panel", description="Открыть панель администратора банка")
 @app_commands.check(check_is_admin)
 async def admin_panel_cmd(interaction: discord.Interaction):
+    if not await safe_defer(interaction, ephemeral=True):
+        return
     embed = discord.Embed(
         title="🛡️ Панель Администратора",
         description="Выберите игрока из выпадающего списка для быстрых операций или воспользуйтесь кнопками ниже.",
         color=discord.Color.red()
     )
     view = await AdminPanelView.create()
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 @bot.tree.command(name="admin_create", description="Создать банковский счет пользователю")
@@ -1775,9 +1929,10 @@ async def admin_panel_cmd(interaction: discord.Interaction):
 async def admin_create_cmd(interaction: discord.Interaction, user: discord.Member):
     data = await get_user_data(user.id)
     if data:
-        await interaction.response.send_message(f"⚠️ У пользователя уже есть счет: `{data[3]}`", ephemeral=True)
+        if await safe_defer(interaction, ephemeral=True):
+            await interaction.followup.send(f"⚠️ У пользователя уже есть счет: `{data[3]}`", ephemeral=True)
         return
-    await interaction.response.send_modal(CreateAccountModal(user))
+    await safe_send_modal(interaction, CreateAccountModal(user))
 
 
 @bot.tree.command(name="admin_add", description="Зачислить средства пользователю")
@@ -1786,9 +1941,10 @@ async def admin_create_cmd(interaction: discord.Interaction, user: discord.Membe
 async def admin_add_cmd(interaction: discord.Interaction, user: discord.Member):
     data = await get_user_data(user.id)
     if not data:
-        await interaction.response.send_message("❌ У выбранного пользователя нет счета!", ephemeral=True)
+        if await safe_defer(interaction, ephemeral=True):
+            await interaction.followup.send("❌ У выбранного пользователя нет счета!", ephemeral=True)
         return
-    await interaction.response.send_modal(ManageBalanceModal("add", prefill_account=data[3]))
+    await safe_send_modal(interaction, ManageBalanceModal("add", prefill_account=data[3]))
 
 
 @bot.tree.command(name="admin_remove", description="Списать средства у пользователя")
@@ -1797,9 +1953,10 @@ async def admin_add_cmd(interaction: discord.Interaction, user: discord.Member):
 async def admin_remove_cmd(interaction: discord.Interaction, user: discord.Member):
     data = await get_user_data(user.id)
     if not data:
-        await interaction.response.send_message("❌ У выбранного пользователя нет счета!", ephemeral=True)
+        if await safe_defer(interaction, ephemeral=True):
+            await interaction.followup.send("❌ У выбранного пользователя нет счета!", ephemeral=True)
         return
-    await interaction.response.send_modal(ManageBalanceModal("remove", prefill_account=data[3]))
+    await safe_send_modal(interaction, ManageBalanceModal("remove", prefill_account=data[3]))
 
 
 @bot.tree.command(name="admin_set", description="Установить баланс пользователю")
@@ -1808,9 +1965,10 @@ async def admin_remove_cmd(interaction: discord.Interaction, user: discord.Membe
 async def admin_set_cmd(interaction: discord.Interaction, user: discord.Member):
     data = await get_user_data(user.id)
     if not data:
-        await interaction.response.send_message("❌ У выбранного пользователя нет счета!", ephemeral=True)
+        if await safe_defer(interaction, ephemeral=True):
+            await interaction.followup.send("❌ У выбранного пользователя нет счета!", ephemeral=True)
         return
-    await interaction.response.send_modal(ManageBalanceModal("set", prefill_account=data[3]))
+    await safe_send_modal(interaction, ManageBalanceModal("set", prefill_account=data[3]))
 
 
 @admin_panel_cmd.error
