@@ -1,4 +1,6 @@
 import os
+import time
+import logging
 import discord
 from discord import app_commands, ButtonStyle
 from discord.ui import View, Button, Modal, TextInput, button, Select
@@ -10,6 +12,9 @@ import asyncio
 import io
 import csv
 
+# Настройка логирования предупреждений Discord (например, если сработал лимит запросов 429)
+logging.basicConfig(level=logging.WARNING, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
+
 # --- НАСТРОЙКИ ---
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -17,6 +22,9 @@ DB_NAME = 'bank.db'
 ADMIN_ROLE_NAME = "Техник"
 LEADER_ROLE_NAME = "Лидер Фракции"
 MAX_AMOUNT = 1_000_000_000_000  # Защита от переполнения SQLite INTEGER (макс. 1 триллион за операцию)
+
+BANK_ACCOUNT_ID = "0000000000"
+BANK_DISCORD_ID = 0
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -30,7 +38,7 @@ user_notifications = {}
 RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3), name="MSK")
 
-# Постоянное подключение к БД и блокировка записи для мгновенного отклика без создания потоков на каждый клик
+# Постоянное подключение к БД и блокировка записи
 _db_conn: aiosqlite.Connection | None = None
 _db_init_lock = asyncio.Lock()
 db_write_lock = asyncio.Lock()
@@ -41,6 +49,34 @@ db_write_lock = asyncio.Lock()
 def get_msk_now() -> datetime.datetime:
     """Возвращает точное московское время (UTC+3) независимо от часового пояса хостинга"""
     return datetime.datetime.now(datetime.timezone.utc).astimezone(MSK_TZ)
+
+
+def get_treasury_account_id(prefix: str) -> str:
+    """Возвращает 10-значный номер счета казны для кода фракции (например, '01' -> '0100000000')"""
+    clean = (prefix or "01")[:2].zfill(2)
+    return f"{clean}00000000"
+
+
+def get_treasury_discord_id(prefix: str) -> int:
+    """Возвращает отрицательный системный ID для записи казны фракции в таблице users"""
+    try:
+        val = int(prefix)
+        return -val if val > 0 else -100
+    except ValueError:
+        return -999
+
+
+def is_treasury_account(account_id: str) -> bool:
+    return (
+        len(account_id) == 10
+        and account_id.isdigit()
+        and account_id != BANK_ACCOUNT_ID
+        and account_id.endswith("00000000")
+    )
+
+
+def format_money(val: int) -> str:
+    return f"{val:,}".replace(",", " ")
 
 
 def calc_delta_seconds(val: int, unit: str) -> int:
@@ -96,8 +132,12 @@ UNIT_LABELS = {
 TX_TYPE_LABELS = {
     'user_transfer': ('💸 Перевод', 'user_transfer'),
     'auto_transfer': ('🔄 Автоплатеж', 'auto_transfer'),
-    'admin_deposit': ('💰 Зачисление (Админ)', 'admin_deposit'),
-    'admin_withdraw': ('📉 Списание (Админ)', 'admin_withdraw'),
+    'bank_auto_deposit': ('🏦 Автоначисление (Банк)', 'bank_auto_deposit'),
+    'bank_auto_withdraw': ('🏦 Автосписание (Банк)', 'bank_auto_withdraw'),
+    'faction_deposit': ('📥 Взнос в казну', 'faction_deposit'),
+    'faction_withdraw': ('📤 Снятие из казны', 'faction_withdraw'),
+    'admin_deposit': ('💰 Зачисление (Банк)', 'admin_deposit'),
+    'admin_withdraw': ('📉 Списание (Банк)', 'admin_withdraw'),
     'admin_set': ('⚙️ Установка баланса', 'admin_set'),
 }
 
@@ -115,11 +155,9 @@ def parse_first_run_datetime(
     time_str = time_str.strip()
     shifted_tomorrow = False
 
-    # 1. Если ОБА поля пустые -> берем текущую дату и текущее время (списание начнется сразу)
     if not date_str and not time_str:
         return now, None, False
 
-    # 2. Разбираем дату (если указана)
     parsed_date: datetime.date | None = None
     if date_str:
         for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
@@ -140,7 +178,6 @@ def parse_first_run_datetime(
         if parsed_date > now.date() + datetime.timedelta(days=3650):
             return None, "❌ Дата слишком далеко в будущем (максимум 10 лет)!", False
 
-    # 3. Разбираем время (если указано)
     parsed_time: datetime.time | None = None
     if time_str:
         for fmt in ("%H:%M:%S", "%H:%M"):
@@ -156,8 +193,6 @@ def parse_first_run_datetime(
                 False
             )
 
-    # 4. Комбинируем дату и время по правилам:
-    # Случай А: Дата ПУСТАЯ, а Время УКАЗАНО
     if parsed_date is None and parsed_time is not None:
         candidate = datetime.datetime.combine(
             now.date(),
@@ -169,7 +204,6 @@ def parse_first_run_datetime(
             shifted_tomorrow = True
         return candidate, None, shifted_tomorrow
 
-    # Случай Б: Дата УКАЗАНА, а Время ПУСТОЕ -> ставим указанную дату и текущее время
     if parsed_date is not None and parsed_time is None:
         candidate = datetime.datetime.combine(
             parsed_date,
@@ -178,7 +212,6 @@ def parse_first_run_datetime(
         )
         return candidate, None, False
 
-    # Случай В: И Дата, и Время УКАЗАНЫ явно
     candidate = datetime.datetime.combine(
         parsed_date,
         parsed_time,
@@ -211,49 +244,84 @@ def check_is_leader(interaction: discord.Interaction) -> bool:
 
 
 def build_profile_embed(user_data) -> discord.Embed:
-    embed = discord.Embed(title="🏦 Личный кабинет", color=discord.Color.green())
+    balance = user_data[4]
+    is_blocked = balance < 0
+
+    if is_blocked:
+        embed = discord.Embed(
+            title="🏦 Личный кабинет — ⛔ СЧЕТ ЗАБЛОКИРОВАН",
+            description=(
+                f"⚠️ **Ваш банковский счет заблокирован из-за задолженности перед Банком!**\n"
+                f"Все исходящие переводы и операции приостановлены.\n"
+                f"Пополните счет минимум на **{format_money(abs(balance))}**, чтобы погасить долг и вернуть доступ к функциям."
+            ),
+            color=discord.Color.dark_red()
+        )
+    else:
+        embed = discord.Embed(title="🏦 Личный кабинет", color=discord.Color.green())
+
     embed.add_field(name="👤 Пользователь", value=user_data[1], inline=True)
     embed.add_field(name="🎮 Ник в игре", value=user_data[2], inline=True)
     embed.add_field(name="🛡️ Код фракции", value=f"`{user_data[5]}`", inline=True)
     embed.add_field(name="💳 Номер счета", value=f"`{user_data[3]}`", inline=True)
-    embed.add_field(name="💰 Баланс", value=f"**{user_data[4]:,}**".replace(",", " "), inline=True)
+    status_str = f"⛔ **{format_money(balance)}** (Долг)" if is_blocked else f"**{format_money(balance)}**"
+    embed.add_field(name="💰 Баланс", value=status_str, inline=True)
     return embed
 
 
-async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False) -> bool:
-    """
-    Мгновенно подтверждает получение интеракции Discord, чтобы таймер 3 секунд не истек
-    во время работы с базой данных. Возвращает False, если пакет шел до бота дольше 3 секунд.
-    """
-    if interaction.response.is_done():
-        return True
-    try:
-        if ephemeral:
-            await interaction.response.defer(ephemeral=True)
-        else:
-            await interaction.response.defer()
-        return True
-    except discord.NotFound:
-        print(f"[WARN] Интеракция {interaction.id} истекла (задержка сети/ПК > 3 сек).")
-        return False
-    except discord.HTTPException as e:
-        if e.code == 40060:  # Уже подтверждена
-            return True
-        print(f"[WARN] Ошибка HTTP при defer интеракции {interaction.id}: {e}")
-        return False
-
+# --- МГНОВЕННЫЕ ОТВЕТЫ НА ИНТЕРАКЦИИ (1 HTTP-ЗАПРОС БЕЗ RATE-LIMIT И БЕЗ ЛИШНЕГО DEFER) ---
 
 async def safe_send_modal(interaction: discord.Interaction, modal: Modal) -> bool:
-    """Безопасное открытие модального окна с защитой от ошибки 10062."""
+    """Открывает модальное окно за 1 прямой HTTP-запрос с замером времени отклика Discord API."""
+    t0 = time.perf_counter()
     try:
         await interaction.response.send_modal(modal)
+        dt = time.perf_counter() - t0
+        if dt > 1.0:
+            print(f"[DIAG] send_modal занял {dt:.2f} сек. (задержка сети до серверов Discord).")
         return True
     except discord.NotFound:
-        print(f"[WARN] Не удалось открыть модальное окно: интеракция {interaction.id} истекла (> 3 сек).")
+        print(f"[WARN] Не удалось открыть модальное окно: интеракция {interaction.id} истекла (> 3 сек в пути).")
         return False
     except discord.HTTPException as e:
         print(f"[WARN] Ошибка HTTP при открытии модального окна: {e}")
         return False
+
+
+async def safe_send_ephemeral(
+    interaction: discord.Interaction,
+    content: str | None = None,
+    embed: discord.Embed | None = None,
+    view: View | None = None,
+    file: discord.File | None = None
+):
+    """
+    Отправляет новое эфемерное сообщение за 1 прямой HTTP-запрос (interaction.response.send_message)
+    без предварительного defer(), что исключает двойной пинг и ожидание.
+    """
+    kwargs = {"ephemeral": True}
+    if content is not None:
+        kwargs["content"] = content
+    if embed is not None:
+        kwargs["embed"] = embed
+    if view is not None:
+        kwargs["view"] = view
+    if file is not None:
+        kwargs["file"] = file
+
+    t0 = time.perf_counter()
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(**kwargs)
+        else:
+            await interaction.followup.send(**kwargs)
+        dt = time.perf_counter() - t0
+        if dt > 1.0:
+            print(f"[DIAG] send_message занял {dt:.2f} сек. (задержка сети/API Discord).")
+    except discord.NotFound:
+        print(f"[WARN] Интеракция {interaction.id} истекла до отправки ответа (> 3 сек в пути).")
+    except discord.HTTPException as e:
+        print(f"[WARN] Ошибка HTTP при отправке сообщения {interaction.id}: {e}")
 
 
 async def safe_edit_or_send(
@@ -262,21 +330,27 @@ async def safe_edit_or_send(
     embed: discord.Embed | None = None,
     view: View | None = None
 ):
-    """Безопасное обновление сообщения из модалки/кнопки с защитой от ошибки 10062 (Unknown interaction)"""
-    kwargs = {}
-    if content is not None or interaction.response.is_done():
-        # При редактировании передаем content (даже если он None, чтобы очистить старый текст)
-        kwargs["content"] = content
+    """
+    Мгновенно обновляет сообщение за 1 прямой HTTP-запрос (interaction.response.edit_message — тип 7 UPDATE_MESSAGE).
+    В отличие от связки defer() + edit_original_response(), прямой edit_message:
+    1) Выполняется в 2 раза быстрее (1 сетевой запрос вместо 2);
+    2) НЕ попадает под жесткий лимит Discord (5 запросов за 5 сек на вебхук сообщения) при быстрых кликах по меню!
+    """
+    kwargs = {"content": content}
     if embed is not None:
         kwargs["embed"] = embed
     if view is not None:
         kwargs["view"] = view
 
+    t0 = time.perf_counter()
     try:
         if not interaction.response.is_done():
             await interaction.response.edit_message(**kwargs)
         else:
             await interaction.edit_original_response(**kwargs)
+        dt = time.perf_counter() - t0
+        if dt > 1.0:
+            print(f"[DIAG] edit_message занял {dt:.2f} сек. (задержка сети/API Discord).")
     except discord.NotFound:
         try:
             send_kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -285,17 +359,44 @@ async def safe_edit_or_send(
             else:
                 await interaction.followup.send(**send_kwargs, ephemeral=True)
         except discord.HTTPException as e:
-            print(f"[WARN] Не удалось обновить/отправить сообщение для интеракции {interaction.id}: {e}")
+            print(f"[WARN] Не удалось обновить сообщение для интеракции {interaction.id}: {e}")
     except discord.HTTPException as e:
         print(f"[WARN] Ошибка HTTP при обновлении сообщения {interaction.id}: {e}")
 
 
 # --- БАЗА ДАННЫХ (ЕДИНОЕ ПОСТОЯННОЕ ПОДКЛЮЧЕНИЕ В ПАМЯТИ) ---
 
+async def ensure_bank_account(conn: aiosqlite.Connection):
+    """Гарантирует наличие главного счета Центрального Банка (0000000000)"""
+    await conn.execute(
+        '''
+        INSERT OR IGNORE INTO users (discord_id, discord_tag, game_nick, account_id, balance, faction_prefix)
+        VALUES (?, ?, ?, ?, 1000000000, '00')
+        ''',
+        (BANK_DISCORD_ID, "SYSTEM_BANK", "🏦 Центральный Банк", BANK_ACCOUNT_ID)
+    )
+
+
+async def ensure_faction_treasury(conn: aiosqlite.Connection, prefix: str) -> str:
+    """Гарантирует наличие 10-значного счета казны фракции (XX00000000) в таблице users"""
+    clean_prefix = (prefix or "01")[:2].zfill(2)
+    if clean_prefix == "00":
+        return BANK_ACCOUNT_ID
+    treasury_acc = get_treasury_account_id(clean_prefix)
+    treasury_did = get_treasury_discord_id(clean_prefix)
+    await conn.execute(
+        '''
+        INSERT OR IGNORE INTO users (discord_id, discord_tag, game_nick, account_id, balance, faction_prefix)
+        VALUES (?, ?, ?, ?, 0, ?)
+        ''',
+        (treasury_did, f"КАЗНА_{clean_prefix}", f"🛡️ Казна фракции #{clean_prefix}", treasury_acc, clean_prefix)
+    )
+    return treasury_acc
+
+
 async def get_db() -> aiosqlite.Connection:
     """
-    Возвращает единое постоянное соединение с SQLite.
-    Исключает создание нового потока Windows и переоткрытие файла при каждом клике.
+    Возвращает единое постоянное соединение с SQLite с кэшированием в оперативной памяти (RAM).
     """
     global _db_conn
     if _db_conn is not None:
@@ -306,6 +407,8 @@ async def get_db() -> aiosqlite.Connection:
             conn = await aiosqlite.connect(DB_NAME)
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute("PRAGMA temp_store=MEMORY")
+            await conn.execute("PRAGMA mmap_size=67108864")  # 64 МБ отображаются напрямую в RAM
             await conn.execute("PRAGMA busy_timeout=5000")
             await conn.execute("PRAGMA cache_size=-16000")
 
@@ -341,11 +444,18 @@ async def get_db() -> aiosqlite.Connection:
                     interval_val INTEGER,
                     interval_unit TEXT,
                     next_run TEXT,
-                    is_active INTEGER DEFAULT 1
+                    is_active INTEGER DEFAULT 1,
+                    is_bank INTEGER DEFAULT 0
                 )
             ''')
 
-            # Индексы для мгновенного поиска без полного сканирования таблиц
+            # Безопасная миграция для существующих БД (добавляем колонку is_bank, если её не было)
+            async with conn.execute("PRAGMA table_info(auto_payments)") as cur:
+                cols = [row[1] for row in await cur.fetchall()]
+            if "is_bank" not in cols:
+                await conn.execute("ALTER TABLE auto_payments ADD COLUMN is_bank INTEGER DEFAULT 0")
+
+            # Индексы для мгновенного поиска
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_account ON users(account_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_faction ON users(faction_prefix)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_sender ON transactions(sender_acc)")
@@ -353,6 +463,15 @@ async def get_db() -> aiosqlite.Connection:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions(created_at)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_ap_active_next ON auto_payments(is_active, next_run)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_ap_owner ON auto_payments(owner_did)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_ap_sender ON auto_payments(sender_acc)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_ap_receiver ON auto_payments(receiver_acc)")
+
+            # Создаем счет Центрального Банка и счета казны для всех существующих фракций
+            await ensure_bank_account(conn)
+            async with conn.execute("SELECT DISTINCT faction_prefix FROM users WHERE discord_id > 0") as cur:
+                prefixes = [r[0] for r in await cur.fetchall() if r[0] and r[0] != "00"]
+            for pfx in prefixes:
+                await ensure_faction_treasury(conn, pfx)
 
             await conn.commit()
             _db_conn = conn
@@ -375,13 +494,59 @@ async def get_user_by_account(account_id: str):
         return await cursor.fetchone()
 
 
+async def get_bank_balance() -> int:
+    db = await get_db()
+    async with db.execute('SELECT balance FROM users WHERE account_id = ?', (BANK_ACCOUNT_ID,)) as cursor:
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_faction_treasury_data(prefix: str):
+    clean_prefix = (prefix or "01")[:2].zfill(2)
+    db = await get_db()
+    treasury_acc = get_treasury_account_id(clean_prefix)
+    async with db.execute('SELECT * FROM users WHERE account_id = ?', (treasury_acc,)) as cursor:
+        row = await cursor.fetchone()
+    if not row:
+        async with db_write_lock:
+            await ensure_faction_treasury(db, clean_prefix)
+            await db.commit()
+        async with db.execute('SELECT * FROM users WHERE account_id = ?', (treasury_acc,)) as cursor:
+            row = await cursor.fetchone()
+    return row
+
+
 async def get_faction_members(prefix: str):
+    """Возвращает только реальных игроков фракции (discord_id > 0), без технического счета казны"""
     db = await get_db()
     async with db.execute(
-        'SELECT * FROM users WHERE faction_prefix = ? OR account_id LIKE ?',
+        'SELECT * FROM users WHERE (faction_prefix = ? OR account_id LIKE ?) AND discord_id > 0 ORDER BY game_nick ASC',
         (prefix, f"{prefix}%")
     ) as cursor:
         return await cursor.fetchall()
+
+
+async def get_user_autopayments(discord_id: int, account_id: str):
+    """
+    Возвращает все автоплатежи, видимые пользователю в профиле:
+    1) Обязательные автоплатежи от Банка (is_bank = 1) по этому счету
+    2) Личные автоплатежи пользователя (owner_did = discord_id и is_bank = 0)
+    """
+    db = await get_db()
+    async with db.execute(
+        '''
+        SELECT id, owner_did, sender_acc, receiver_acc, amount, interval_val, interval_unit, next_run, is_active, is_bank
+        FROM auto_payments
+        WHERE is_active = 1
+          AND (
+              (owner_did = ? AND COALESCE(is_bank, 0) = 0)
+              OR (COALESCE(is_bank, 0) = 1 AND (sender_acc = ? OR receiver_acc = ?))
+          )
+        ORDER BY COALESCE(is_bank, 0) DESC, next_run ASC
+        ''',
+        (discord_id, account_id, account_id)
+    ) as cur:
+        return await cur.fetchall()
 
 
 async def log_transaction(db: aiosqlite.Connection, t_type: str, sender: str | None, receiver: str | None, amount: int):
@@ -393,6 +558,8 @@ async def log_transaction(db: aiosqlite.Connection, t_type: str, sender: str | N
 
 
 async def add_notification(user_id: int, message: str):
+    if not user_id or user_id <= 0:
+        return
     if user_id not in user_notifications:
         user_notifications[user_id] = []
     user_notifications[user_id].insert(0, {
@@ -411,53 +578,125 @@ async def auto_payment_task():
     try:
         now_str = get_msk_now().strftime("%Y-%m-%d %H:%M:%S")
         db = await get_db()
+
+        # Быстрая проверка без блокировки записи: есть ли вообще платежи к исполнению
+        async with db.execute(
+            '''
+            SELECT id, owner_did, sender_acc, receiver_acc, amount, interval_val, interval_unit, next_run, is_active, COALESCE(is_bank, 0)
+            FROM auto_payments
+            WHERE is_active = 1 AND next_run <= ?
+            ''',
+            (now_str,)
+        ) as cursor:
+            payments = await cursor.fetchall()
+
+        if not payments:
+            return
+
         async with db_write_lock:
-            async with db.execute(
-                "SELECT * FROM auto_payments WHERE is_active = 1 AND next_run <= ?",
-                (now_str,)
-            ) as cursor:
-                payments = await cursor.fetchall()
-
-            if not payments:
-                return
-
+            changed = False
             for p in payments:
-                pay_id, owner_did, s_acc, r_acc, amount, i_val, i_unit, next_run_str, is_active = p
+                pay_id, owner_did, s_acc, r_acc, amount, i_val, i_unit, next_run_str, is_active, is_bank = p
 
                 if amount <= 0 or s_acc == r_acc:
                     await db.execute('UPDATE auto_payments SET is_active = 0 WHERE id = ?', (pay_id,))
+                    changed = True
                     continue
 
-                # Атомарное списание: баланс уменьшается ТОЛЬКО если на счете сейчас достаточно средств
-                cur_deduct = await db.execute(
-                    'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
-                    (amount, s_acc, amount)
-                )
-                if cur_deduct.rowcount == 0:
-                    continue
-
-                async with db.execute('SELECT discord_id FROM users WHERE account_id = ?', (r_acc,)) as cur:
+                # Проверяем существование обоих счетов
+                async with db.execute('SELECT balance, discord_id, game_nick FROM users WHERE account_id = ?', (s_acc,)) as cur:
+                    s_row = await cur.fetchone()
+                async with db.execute('SELECT balance, discord_id, game_nick FROM users WHERE account_id = ?', (r_acc,)) as cur:
                     r_row = await cur.fetchone()
-                    if not r_row:
-                        await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, s_acc))
-                        await db.execute('UPDATE auto_payments SET is_active = 0 WHERE id = ?', (pay_id,))
+
+                if not s_row or not r_row:
+                    await db.execute('UPDATE auto_payments SET is_active = 0 WHERE id = ?', (pay_id,))
+                    changed = True
+                    continue
+
+                s_bal, s_did, s_nick = s_row
+                r_bal, r_did, r_nick = r_row
+
+                # --- ЛОГИКА 1: АВТОПЛАТЕЖ ОТ БАНКА (is_bank == 1) ---
+                if is_bank == 1:
+                    if s_acc == BANK_ACCOUNT_ID:
+                        # Начисление от Банка игроку/фракции (со счета Банка)
+                        cur_bank = await db.execute(
+                            'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                            (amount, BANK_ACCOUNT_ID, amount)
+                        )
+                        if cur_bank.rowcount == 0:
+                            continue
+
+                        await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, r_acc))
+                        await log_transaction(db, 'bank_auto_deposit', BANK_ACCOUNT_ID, r_acc, amount)
+
+                        if r_did and r_did > 0:
+                            new_r_bal = r_bal + amount
+                            if r_bal < 0 and new_r_bal >= 0:
+                                await add_notification(r_did, f"🏦 Автоначисление от Банка: **+{format_money(amount)}**. 🔓 Ваш счет разблокирован!")
+                            else:
+                                await add_notification(r_did, f"🏦 Автоначисление от Банка: **+{format_money(amount)}**.")
+
+                        new_next_run = compute_next_run_after(next_run_str, i_val, i_unit)
+                        await db.execute('UPDATE auto_payments SET next_run = ? WHERE id = ?', (new_next_run, pay_id))
+                        changed = True
+
+                    elif r_acc == BANK_ACCOUNT_ID:
+                        # Списание Банком со счета игрока/фракции
+                        # Если счет уже в минусе (заблокирован) — повторно в минус не уводим! Ждем погашения долга.
+                        if s_bal < 0:
+                            continue
+
+                        new_s_bal = s_bal - amount
+                        await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (new_s_bal, s_acc))
+                        await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, BANK_ACCOUNT_ID))
+                        await log_transaction(db, 'bank_auto_withdraw', s_acc, BANK_ACCOUNT_ID, amount)
+
+                        if s_did and s_did > 0:
+                            if new_s_bal < 0:
+                                await add_notification(
+                                    s_did,
+                                    f"⛔ Обязательное списание Банка (**-{format_money(amount)}**): средств не хватило, счет ушел в минус (**{format_money(new_s_bal)}**) и заблокирован!"
+                                )
+                            else:
+                                await add_notification(
+                                    s_did,
+                                    f"🏦 Обязательное автосписание в Банк: **-{format_money(amount)}** (остаток: **{format_money(new_s_bal)}**)."
+                                )
+
+                        new_next_run = compute_next_run_after(next_run_str, i_val, i_unit)
+                        await db.execute('UPDATE auto_payments SET next_run = ? WHERE id = ?', (new_next_run, pay_id))
+                        changed = True
+
+                # --- ЛОГИКА 2: ОБЫЧНЫЙ АВТОПЛАТЕЖ ИГРОКА (is_bank == 0) ---
+                else:
+                    if s_bal < amount:
                         continue
-                    r_owner_id = r_row[0]
 
-                await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, r_acc))
-                await log_transaction(db, 'auto_transfer', s_acc, r_acc, amount)
+                    cur_deduct = await db.execute(
+                        'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                        (amount, s_acc, amount)
+                    )
+                    if cur_deduct.rowcount == 0:
+                        continue
 
-                await add_notification(owner_did, f"✅ Автоплатеж **{amount}** на `{r_acc}` выполнен.")
-                if r_owner_id:
-                    await add_notification(r_owner_id, f"💰 Получен автоплатеж **{amount}** от `{s_acc}`.")
+                    await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, r_acc))
+                    await log_transaction(db, 'auto_transfer', s_acc, r_acc, amount)
 
-                new_next_run = compute_next_run_after(next_run_str, i_val, i_unit)
-                await db.execute(
-                    'UPDATE auto_payments SET next_run = ? WHERE id = ?',
-                    (new_next_run, pay_id)
-                )
+                    await add_notification(owner_did, f"✅ Автоплатеж **{format_money(amount)}** на `{r_acc}` ({r_nick}) выполнен.")
+                    if r_did and r_did > 0:
+                        await add_notification(r_did, f"💰 Получен автоплатеж **{format_money(amount)}** от `{s_acc}` ({s_nick}).")
 
-            await db.commit()
+                    new_next_run = compute_next_run_after(next_run_str, i_val, i_unit)
+                    await db.execute(
+                        'UPDATE auto_payments SET next_run = ? WHERE id = ?',
+                        (new_next_run, pay_id)
+                    )
+                    changed = True
+
+            if changed:
+                await db.commit()
     except Exception as e:
         print(f"[Ошибка в auto_payment_task]: {e}")
 
@@ -485,37 +724,49 @@ class CreateAccountModal(Modal, title="Создание банковского �
         self.add_item(self.account_id)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction, ephemeral=True):
-            return
         if not check_is_admin(interaction):
-            await interaction.followup.send("❌ У вас нет прав администратора!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ У вас нет прав администратора!")
+            return
+
+        existing = await get_user_data(self.target_user.id)
+        if existing:
+            await safe_send_ephemeral(interaction, f"⚠️ У пользователя {self.target_user.mention} уже есть счет: `{existing[3]}`")
             return
 
         acc_id = self.account_id.value.strip()
         if not acc_id.isdigit() or len(acc_id) != 10:
-            await interaction.followup.send("❌ ID счета должен состоять ровно из 10 цифр!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ ID счета должен состоять ровно из 10 цифр!")
             return
 
         prefix = acc_id[:2]
+        if prefix == "00":
+            await safe_send_ephemeral(interaction, "❌ Префикс `00` зарезервирован за Центральным Банком! Используйте коды фракций `01`–`99`.")
+            return
+
+        if acc_id.endswith("00000000"):
+            await safe_send_ephemeral(interaction, f"❌ Счет `{acc_id}` зарезервирован под общую казну фракции `{prefix}`! Укажите другой номер (например, `{prefix}00000001`).")
+            return
+
         db = await get_db()
         async with db_write_lock:
             try:
+                await ensure_faction_treasury(db, prefix)
                 await db.execute(
                     'INSERT INTO users (discord_id, discord_tag, game_nick, account_id, balance, faction_prefix) VALUES (?, ?, ?, ?, 0, ?)',
                     (self.target_user.id, self.target_user.name, self.game_nick.value.strip(), acc_id, prefix)
                 )
                 await db.commit()
             except aiosqlite.IntegrityError:
-                await interaction.followup.send(
-                    "❌ Такой ID счета или пользователь уже зарегистрирован в системе!",
-                    ephemeral=True
+                await safe_send_ephemeral(
+                    interaction,
+                    "❌ Такой ID счета или пользователь уже зарегистрирован в системе!"
                 )
                 return
 
         await add_notification(self.target_user.id, f"🎉 Вам открыт счет `{acc_id}`!")
-        await interaction.followup.send(
-            f"✅ Счет `{acc_id}` успешно создан для {self.target_user.mention} (Ник: **{self.game_nick.value.strip()}**, Фракция: `{prefix}`).",
-            ephemeral=True
+        await safe_send_ephemeral(
+            interaction,
+            f"✅ Счет `{acc_id}` успешно создан для {self.target_user.mention} (Ник: **{self.game_nick.value.strip()}**, Фракция: `{prefix}`, Казна фракции: `{get_treasury_account_id(prefix)}`)."
         )
 
 
@@ -531,16 +782,16 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
         }
         self.amount_input = TextInput(
             label=labels.get(action_type, "Сумма"),
-            placeholder="Введите целое положительное число",
+            placeholder="Введите целое число",
             required=True,
-            max_length=12
+            max_length=13
         )
         self.add_item(self.amount_input)
 
         if not self.prefill_account:
             self.account_input = TextInput(
                 label="ID Счета (10 цифр)",
-                placeholder="Введите 10-значный номер счета",
+                placeholder="Счет игрока, казны (XX00000000) или Банка (0000000000)",
                 required=True,
                 max_length=10,
                 min_length=10
@@ -548,29 +799,27 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
             self.add_item(self.account_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction, ephemeral=True):
-            return
         if not check_is_admin(interaction):
-            await interaction.followup.send("❌ У вас нет прав администратора!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ У вас нет прав администратора!")
             return
 
         try:
             amount = int(self.amount_input.value.strip())
         except ValueError:
-            await interaction.followup.send("❌ Сумма должна быть числом!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Сумма должна быть целым числом!")
             return
 
-        if (self.action_type in ("add", "remove") and amount <= 0) or (self.action_type == "set" and amount < 0):
-            await interaction.followup.send("❌ Указана некорректная сумма!", ephemeral=True)
+        if self.action_type in ("add", "remove") and amount <= 0:
+            await safe_send_ephemeral(interaction, "❌ Сумма зачисления/списания должна быть больше 0!")
             return
 
-        if amount > MAX_AMOUNT:
-            await interaction.followup.send(f"❌ Сумма превышает максимально допустимый лимит ({MAX_AMOUNT:,})!", ephemeral=True)
+        if abs(amount) > MAX_AMOUNT:
+            await safe_send_ephemeral(interaction, f"❌ Сумма превышает максимально допустимый лимит ({format_money(MAX_AMOUNT)})!")
             return
 
         acc_id = self.prefill_account or self.account_input.value.strip()
         if not acc_id.isdigit() or len(acc_id) != 10:
-            await interaction.followup.send("❌ ID счета должен состоять из 10 цифр!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ ID счета должен состоять из 10 цифр!")
             return
 
         db = await get_db()
@@ -578,32 +827,73 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
             async with db.execute('SELECT balance, discord_id, game_nick FROM users WHERE account_id = ?', (acc_id,)) as cursor:
                 row = await cursor.fetchone()
                 if not row:
-                    await interaction.followup.send("❌ Счет не найден!", ephemeral=True)
+                    await safe_send_ephemeral(interaction, "❌ Счет не найден!")
                     return
 
                 current_bal, target_did, game_nick = row
 
-                if self.action_type == "add":
-                    await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, acc_id))
-                    await log_transaction(db, "admin_deposit", None, acc_id, amount)
-                    await add_notification(target_did, f"💰 Зачисление от банка: **+{amount}**.")
-                elif self.action_type == "remove":
-                    cur_rem = await db.execute(
-                        'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
-                        (amount, acc_id, amount)
-                    )
-                    if cur_rem.rowcount == 0:
-                        await interaction.followup.send(
-                            f"❌ Недостаточно средств на счете (доступно: **{current_bal}**).",
-                            ephemeral=True
+                # Если редактируется сам счет Центрального Банка (0000000000)
+                if acc_id == BANK_ACCOUNT_ID:
+                    if self.action_type == "add":
+                        await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, BANK_ACCOUNT_ID))
+                        await log_transaction(db, "admin_deposit", None, BANK_ACCOUNT_ID, amount)
+                    elif self.action_type == "remove":
+                        cur_rem = await db.execute(
+                            'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                            (amount, BANK_ACCOUNT_ID, amount)
                         )
-                        return
-                    await log_transaction(db, "admin_withdraw", acc_id, None, amount)
-                    await add_notification(target_did, f"📉 Списание банком: **-{amount}**.")
-                elif self.action_type == "set":
-                    await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (amount, acc_id))
-                    await log_transaction(db, "admin_set", acc_id, acc_id, amount)
-                    await add_notification(target_did, f"⚙️ Ваш баланс установлен на **{amount}**.")
+                        if cur_rem.rowcount == 0:
+                            await safe_send_ephemeral(
+                                interaction,
+                                f"❌ В казне Банка недостаточно средств (доступно: **{format_money(current_bal)}**)."
+                            )
+                            return
+                        await log_transaction(db, "admin_withdraw", BANK_ACCOUNT_ID, None, amount)
+                    elif self.action_type == "set":
+                        await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (amount, BANK_ACCOUNT_ID))
+                        await log_transaction(db, "admin_set", BANK_ACCOUNT_ID, BANK_ACCOUNT_ID, amount)
+
+                # Если редактируется счет игрока или казны фракции (средства идут со счета Банка / на счет Банка)
+                else:
+                    if self.action_type == "add":
+                        cur_bank = await db.execute(
+                            'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                            (amount, BANK_ACCOUNT_ID, amount)
+                        )
+                        if cur_bank.rowcount == 0:
+                            bank_bal = await get_bank_balance()
+                            await safe_send_ephemeral(
+                                interaction,
+                                f"❌ На счете Центрального Банка (`{BANK_ACCOUNT_ID}`) недостаточно средств для выдачи!\n"
+                                f"Доступно в Банке: **{format_money(bank_bal)}**. Пополните счет Банка в админ-панели."
+                            )
+                            return
+                        await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, acc_id))
+                        await log_transaction(db, "admin_deposit", BANK_ACCOUNT_ID, acc_id, amount)
+                        if current_bal < 0 and (current_bal + amount) >= 0:
+                            await add_notification(target_did, f"💰 Зачисление от Банка: **+{format_money(amount)}**. 🔓 Долг погашен, ваш счет разблокирован!")
+                        else:
+                            await add_notification(target_did, f"💰 Зачисление от Банка: **+{format_money(amount)}**.")
+
+                    elif self.action_type == "remove":
+                        cur_rem = await db.execute(
+                            'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                            (amount, acc_id, amount)
+                        )
+                        if cur_rem.rowcount == 0:
+                            await safe_send_ephemeral(
+                                interaction,
+                                f"❌ Недостаточно средств на счете `{acc_id}` (доступно: **{format_money(current_bal)}**)."
+                            )
+                            return
+                        await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, BANK_ACCOUNT_ID))
+                        await log_transaction(db, "admin_withdraw", acc_id, BANK_ACCOUNT_ID, amount)
+                        await add_notification(target_did, f"📉 Списание в пользу Банка: **-{format_money(amount)}**.")
+
+                    elif self.action_type == "set":
+                        await db.execute('UPDATE users SET balance = ? WHERE account_id = ?', (amount, acc_id))
+                        await log_transaction(db, "admin_set", acc_id, acc_id, amount)
+                        await add_notification(target_did, f"⚙️ Ваш баланс установлен Банком на **{format_money(amount)}**.")
 
                 await db.commit()
 
@@ -611,12 +901,14 @@ class ManageBalanceModal(Modal, title="Операция с балансом"):
                     new_bal_row = await cur_new.fetchone()
                     new_bal = new_bal_row[0] if new_bal_row else 0
 
+        bank_bal_now = await get_bank_balance()
         action_names = {"add": "Зачислено", "remove": "Списано", "set": "Установлен баланс"}
-        await interaction.followup.send(
-            f"✅ {action_names[self.action_type]}: **{amount}**\n"
-            f"Игрок: **{game_nick}** (`{acc_id}`)\n"
-            f"Текущий баланс: **{new_bal}**",
-            ephemeral=True
+        await safe_send_ephemeral(
+            interaction,
+            f"✅ {action_names[self.action_type]}: **{format_money(amount)}**\n"
+            f"Счет: **{game_nick}** (`{acc_id}`)\n"
+            f"Новый баланс счета: **{format_money(new_bal)}**\n"
+            f"🏦 Баланс Центрального Банка: **{format_money(bank_bal_now)}**"
         )
 
 
@@ -627,7 +919,7 @@ class TransferModal(Modal, title="Перевод средств"):
         if not self.prefill_target:
             self.target_acc = TextInput(
                 label="ID Счета получателя",
-                placeholder="10 цифр",
+                placeholder="10 цифр (игрок или казна фракции XX00000000)",
                 required=True,
                 max_length=10,
                 min_length=10
@@ -643,23 +935,21 @@ class TransferModal(Modal, title="Перевод средств"):
         self.add_item(self.amount)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction, ephemeral=True):
-            return
         sender_id = interaction.user.id
         target_acc = self.prefill_target or self.target_acc.value.strip()
 
         try:
             amount = int(self.amount.value.strip())
         except ValueError:
-            await interaction.followup.send("❌ Сумма должна быть числом!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Сумма должна быть числом!")
             return
 
         if amount <= 0 or amount > MAX_AMOUNT:
-            await interaction.followup.send("❌ Сумма перевода должна быть больше нуля и в пределах лимита!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Сумма перевода должна быть больше нуля и в пределах лимита!")
             return
 
         if not target_acc.isdigit() or len(target_acc) != 10:
-            await interaction.followup.send("❌ ID счета получателя должен состоять из 10 цифр!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ ID счета получателя должен состоять из 10 цифр!")
             return
 
         db = await get_db()
@@ -667,49 +957,214 @@ class TransferModal(Modal, title="Перевод средств"):
             async with db.execute('SELECT account_id, balance, game_nick FROM users WHERE discord_id = ?', (sender_id,)) as cur:
                 sender_row = await cur.fetchone()
                 if not sender_row:
-                    await interaction.followup.send("❌ У вас нет банковского счета!", ephemeral=True)
+                    await safe_send_ephemeral(interaction, "❌ У вас нет банковского счета!")
                     return
 
             sender_acc, sender_bal, sender_nick = sender_row
 
-            if target_acc == sender_acc:
-                await interaction.followup.send("❌ Нельзя перевести средства самому себе!", ephemeral=True)
+            if sender_bal < 0:
+                await safe_send_ephemeral(
+                    interaction,
+                    f"⛔ **Ваш счет заблокирован из-за задолженности ({format_money(sender_bal)})!**\n"
+                    f"Пополните баланс минимум на **{format_money(abs(sender_bal))}**, чтобы разблокировать переводы."
+                )
                 return
 
-            async with db.execute('SELECT discord_id, game_nick FROM users WHERE account_id = ?', (target_acc,)) as cursor:
+            if target_acc == sender_acc:
+                await safe_send_ephemeral(interaction, "❌ Нельзя перевести средства самому себе!")
+                return
+
+            if is_treasury_account(target_acc):
+                await ensure_faction_treasury(db, target_acc[:2])
+
+            async with db.execute('SELECT balance, discord_id, game_nick FROM users WHERE account_id = ?', (target_acc,)) as cursor:
                 recv = await cursor.fetchone()
                 if not recv:
-                    await interaction.followup.send("❌ Счет получателя не найден!", ephemeral=True)
+                    await safe_send_ephemeral(interaction, "❌ Счет получателя не найден!")
                     return
-                recv_did, recv_nick = recv
+                recv_bal, recv_did, recv_nick = recv
 
             cur_deduct = await db.execute(
                 'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
                 (amount, sender_acc, amount)
             )
             if cur_deduct.rowcount == 0:
-                await interaction.followup.send(
-                    f"❌ Недостаточно средств! Ваш баланс: **{sender_bal}**",
-                    ephemeral=True
+                await safe_send_ephemeral(
+                    interaction,
+                    f"❌ Недостаточно средств! Ваш баланс: **{format_money(sender_bal)}**"
                 )
                 return
 
             await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, target_acc))
-            await log_transaction(db, 'user_transfer', sender_acc, target_acc, amount)
+            tx_type = 'faction_deposit' if is_treasury_account(target_acc) else 'user_transfer'
+            await log_transaction(db, tx_type, sender_acc, target_acc, amount)
             await db.commit()
 
             async with db.execute('SELECT balance FROM users WHERE account_id = ?', (sender_acc,)) as cur_b:
                 b_row = await cur_b.fetchone()
                 new_s_bal = b_row[0] if b_row else (sender_bal - amount)
 
-        await add_notification(sender_id, f"💸 Перевод **{amount}** на счет `{target_acc}` ({recv_nick}).")
-        await add_notification(recv_did, f"💰 Получен перевод **{amount}** от `{sender_acc}` ({sender_nick}).")
+        await add_notification(sender_id, f"💸 Перевод **{format_money(amount)}** на счет `{target_acc}` ({recv_nick}).")
+        if recv_did and recv_did > 0:
+            if recv_bal < 0 and (recv_bal + amount) >= 0:
+                await add_notification(recv_did, f"💰 Получен перевод **{format_money(amount)}** от `{sender_acc}` ({sender_nick}). 🔓 Ваш счет разблокирован!")
+            else:
+                await add_notification(recv_did, f"💰 Получен перевод **{format_money(amount)}** от `{sender_acc}` ({sender_nick}).")
 
-        await interaction.followup.send(
-            f"✅ Перевод **{amount}** игроку **{recv_nick}** (`{target_acc}`) выполнен!\n"
-            f"Остаток на счете: **{new_s_bal}**",
-            ephemeral=True
+        await safe_send_ephemeral(
+            interaction,
+            f"✅ Перевод **{format_money(amount)}** получателю **{recv_nick}** (`{target_acc}`) выполнен!\n"
+            f"Остаток на вашем счете: **{format_money(new_s_bal)}**"
         )
+
+
+class FactionTreasuryModal(Modal):
+    """Модальное окно для пополнения казны фракции (все участники) или снятия средств из казны (только Лидер)"""
+    def __init__(self, mode: str, faction_prefix: str, faction_view: "FactionView"):
+        title = f"Пополнение казны #{faction_prefix}" if mode == "deposit" else f"Снятие из казны #{faction_prefix}"
+        super().__init__(title=title)
+        self.mode = mode  # 'deposit' | 'withdraw'
+        self.prefix = faction_prefix
+        self.faction_view = faction_view
+        self.treasury_acc = get_treasury_account_id(faction_prefix)
+
+        self.amount_input = TextInput(
+            label="Сумма операции",
+            placeholder="Введите целое положительное число",
+            required=True,
+            max_length=12
+        )
+        self.add_item(self.amount_input)
+
+        if self.mode == "withdraw":
+            self.target_input = TextInput(
+                label="Счет получателя (пусто = на ваш личный счет)",
+                placeholder="Оставьте пустым или укажите 10-значный счет",
+                required=False,
+                max_length=10
+            )
+            self.add_item(self.target_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amount = int(self.amount_input.value.strip())
+        except ValueError:
+            await safe_send_ephemeral(interaction, "❌ Сумма должна быть целым числом!")
+            return
+
+        if amount <= 0 or amount > MAX_AMOUNT:
+            await safe_send_ephemeral(interaction, "❌ Сумма должна быть больше 0 и в пределах лимита!")
+            return
+
+        user_id = interaction.user.id
+        db = await get_db()
+
+        if self.mode == "deposit":
+            async with db_write_lock:
+                await ensure_faction_treasury(db, self.prefix)
+                async with db.execute('SELECT account_id, balance, game_nick FROM users WHERE discord_id = ?', (user_id,)) as cur:
+                    u_row = await cur.fetchone()
+                    if not u_row:
+                        await safe_send_ephemeral(interaction, "❌ У вас нет счета!")
+                        return
+                u_acc, u_bal, u_nick = u_row
+
+                if u_bal < 0:
+                    await safe_send_ephemeral(
+                        interaction,
+                        f"⛔ Ваш счет заблокирован из-за задолженности (**{format_money(u_bal)}**)! Сначала погасите долг."
+                    )
+                    return
+
+                cur_ded = await db.execute(
+                    'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                    (amount, u_acc, amount)
+                )
+                if cur_ded.rowcount == 0:
+                    await safe_send_ephemeral(
+                        interaction,
+                        f"❌ Недостаточно средств на вашем счете (доступно: **{format_money(u_bal)}**)."
+                    )
+                    return
+
+                await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, self.treasury_acc))
+                await log_transaction(db, 'faction_deposit', u_acc, self.treasury_acc, amount)
+                await db.commit()
+
+            await add_notification(user_id, f"📥 Вы внесли **{format_money(amount)}** в казну фракции `{self.treasury_acc}`.")
+            await self.faction_view.refresh_view(
+                interaction,
+                status_text=f"✅ Вы успешно пополнили казну фракции на **{format_money(amount)}**!"
+            )
+
+        elif self.mode == "withdraw":
+            if not check_is_leader(interaction):
+                await safe_send_ephemeral(interaction, "❌ Снимать средства из казны может только Лидер Фракции!")
+                return
+
+            async with db_write_lock:
+                await ensure_faction_treasury(db, self.prefix)
+                async with db.execute('SELECT account_id, game_nick, faction_prefix FROM users WHERE discord_id = ?', (user_id,)) as cur:
+                    leader_row = await cur.fetchone()
+                    if not leader_row:
+                        await safe_send_ephemeral(interaction, "❌ У вас нет счета!")
+                        return
+                leader_acc, leader_nick, leader_pfx = leader_row
+
+                if leader_pfx != self.prefix and not check_is_admin(interaction):
+                    await safe_send_ephemeral(interaction, "❌ Вы не являетесь лидером этой фракции!")
+                    return
+
+                target_acc = self.target_input.value.strip() if self.target_input.value else leader_acc
+                if not target_acc.isdigit() or len(target_acc) != 10:
+                    await safe_send_ephemeral(interaction, "❌ Некорректный 10-значный счет получателя!")
+                    return
+
+                if target_acc == self.treasury_acc:
+                    await safe_send_ephemeral(interaction, "❌ Нельзя вывести средства из казны на саму же казну!")
+                    return
+
+                async with db.execute('SELECT discord_id, game_nick FROM users WHERE account_id = ?', (target_acc,)) as cur:
+                    recv_row = await cur.fetchone()
+                    if not recv_row:
+                        await safe_send_ephemeral(interaction, "❌ Счет получателя не найден!")
+                        return
+                recv_did, recv_nick = recv_row
+
+                async with db.execute('SELECT balance FROM users WHERE account_id = ?', (self.treasury_acc,)) as cur:
+                    t_row = await cur.fetchone()
+                    t_bal = t_row[0] if t_row else 0
+
+                if t_bal < 0:
+                    await safe_send_ephemeral(
+                        interaction,
+                        f"⛔ Казна фракции заблокирована из-за задолженности (**{format_money(t_bal)}**)! Снятие недоступно."
+                    )
+                    return
+
+                cur_ded = await db.execute(
+                    'UPDATE users SET balance = balance - ? WHERE account_id = ? AND balance >= ?',
+                    (amount, self.treasury_acc, amount)
+                )
+                if cur_ded.rowcount == 0:
+                    await safe_send_ephemeral(
+                        interaction,
+                        f"❌ В казне фракции недостаточно средств (доступно: **{format_money(t_bal)}**)."
+                    )
+                    return
+
+                await db.execute('UPDATE users SET balance = balance + ? WHERE account_id = ?', (amount, target_acc))
+                await log_transaction(db, 'faction_withdraw', self.treasury_acc, target_acc, amount)
+                await db.commit()
+
+            await add_notification(user_id, f"📤 Вы сняли **{format_money(amount)}** из казны `{self.treasury_acc}` на счет `{target_acc}` ({recv_nick}).")
+            if recv_did and recv_did > 0 and recv_did != user_id:
+                await add_notification(recv_did, f"💰 Лидер фракции перевел вам **{format_money(amount)}** из казны `{self.treasury_acc}`.")
+
+            await self.faction_view.refresh_view(
+                interaction,
+                status_text=f"✅ Из казны фракции снято **{format_money(amount)}** на счет `{target_acc}` (**{recv_nick}**)!"
+            )
 
 
 class AutoPaymentStepModal(Modal, title="Параметры автоплатежа"):
@@ -718,21 +1173,33 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
         unit: str,
         unit_label: str,
         prefill_date: str = "",
-        prefill_time: str = ""
+        prefill_time: str = "",
+        prefill_account: str = "",
+        is_bank_mode: bool = False,
+        bank_direction: str = "withdraw"  # 'withdraw' (списание в Банк) или 'deposit' (начисление от Банка)
     ):
-        super().__init__()
+        super().__init__(title="Автоплатеж Банка" if is_bank_mode else "Параметры автоплатежа")
         self.unit = unit
         self.unit_label = unit_label
+        self.is_bank_mode = is_bank_mode
+        self.bank_direction = bank_direction
+
+        acc_label = (
+            "Счет игрока/фракции (для списания в Банк)"
+            if (is_bank_mode and bank_direction == "withdraw")
+            else "ID Счета получателя (10 цифр)"
+        )
 
         self.receiver_acc = TextInput(
-            label="ID Счета получателя (10 цифр)",
-            placeholder="Например: 0100000002",
+            label=acc_label,
+            placeholder="Например: 0100000001 или казна 0100000000",
+            default=prefill_account,
             required=True,
             max_length=10,
             min_length=10
         )
         self.amount = TextInput(
-            label="Сумма перевода",
+            label="Сумма операции",
             placeholder="Целое число > 0",
             required=True,
             max_length=12
@@ -744,14 +1211,14 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
             max_length=6
         )
         self.start_date = TextInput(
-            label="Дата 1-го списания (пусто = сегодня)",
+            label="Дата 1-го исполнения (пусто = сегодня)",
             placeholder="ДД.ММ.ГГГГ или ГГГГ-ММ-ДД (необязательно)",
             default=prefill_date,
             required=False,
             max_length=10
         )
         self.start_time = TextInput(
-            label="Время 1-го списания по МСК (пусто = сейчас)",
+            label="Время 1-го исполнения по МСК (пусто = сейчас)",
             placeholder="ЧЧ:ММ (если прошло сегодня — перенесется на завтра)",
             default=prefill_time,
             required=False,
@@ -765,39 +1232,20 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
         self.add_item(self.start_time)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
-        user_id = interaction.user.id
-        user_data = await get_user_data(user_id)
-        if not user_data:
-            await interaction.followup.send("❌ У вас нет счета!", ephemeral=True)
-            return
-
-        sender_acc = user_data[3]
-        r_acc = self.receiver_acc.value.strip()
-
-        if not r_acc.isdigit() or len(r_acc) != 10:
-            await interaction.followup.send("❌ Неверный формат ID счета получателя!", ephemeral=True)
-            return
-
-        if r_acc == sender_acc:
-            await interaction.followup.send("❌ Нельзя настроить автоплатеж самому себе!", ephemeral=True)
-            return
-
-        target_user = await get_user_by_account(r_acc)
-        if not target_user:
-            await interaction.followup.send("❌ Счет получателя не существует в базе!", ephemeral=True)
+        target_acc = self.receiver_acc.value.strip()
+        if not target_acc.isdigit() or len(target_acc) != 10:
+            await safe_send_ephemeral(interaction, "❌ Неверный формат ID счета (должно быть ровно 10 цифр)!")
             return
 
         try:
             amount = int(self.amount.value.strip())
             val = int(self.interval_val.value.strip())
         except ValueError:
-            await interaction.followup.send("❌ Сумма и интервал должны быть целыми числами!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Сумма и интервал должны быть целыми числами!")
             return
 
         if amount <= 0 or amount > MAX_AMOUNT or val <= 0 or val > 10000:
-            await interaction.followup.send("❌ Сумма и интервал должны быть больше 0 и в пределах допустимых лимитов!", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Сумма и интервал должны быть больше 0 и в пределах допустимых лимитов!")
             return
 
         first_dt, err_msg, shifted_tomorrow = parse_first_run_datetime(
@@ -805,33 +1253,109 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
             self.start_time.value
         )
         if err_msg or first_dt is None:
-            await interaction.followup.send(err_msg or "❌ Ошибка даты/времени.", ephemeral=True)
+            await safe_send_ephemeral(interaction, err_msg or "❌ Ошибка даты/времени.")
             return
 
         next_run_str = first_dt.strftime("%Y-%m-%d %H:%M:%S")
-
         db = await get_db()
-        async with db_write_lock:
-            await db.execute(
-                "INSERT INTO auto_payments (owner_did, sender_acc, receiver_acc, amount, interval_val, interval_unit, next_run, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                (user_id, sender_acc, r_acc, amount, val, self.unit, next_run_str)
-            )
-            await db.commit()
-            async with db.execute(
-                "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
-                (user_id,)
-            ) as cur:
-                payments = await cur.fetchall()
+
+        if is_treasury_account(target_acc):
+            async with db_write_lock:
+                await ensure_faction_treasury(db, target_acc[:2])
+                await db.commit()
+
+        target_user = await get_user_by_account(target_acc)
+        if not target_user:
+            await safe_send_ephemeral(interaction, "❌ Указанный счет не существует в базе!")
+            return
 
         note = ""
         if shifted_tomorrow:
-            note = "\nℹ️ *Указанное время сегодня уже прошло, поэтому первое списание автоматически назначено на завтра.*"
+            note = "\nℹ️ *Указанное время сегодня уже прошло, поэтому первое исполнение автоматически назначено на завтра.*"
 
-        embed = build_autopayments_embed(payments)
+        # --- РЕЖИМ 1: СОЗДАНИЕ АВТОПЛАТЕЖА ОТ БАНКА (АДМИН) ---
+        if self.is_bank_mode:
+            if not check_is_admin(interaction):
+                await safe_send_ephemeral(interaction, "❌ Только сотрудники банка могут создавать банковские автоплатежи!")
+                return
+
+            if target_acc == BANK_ACCOUNT_ID:
+                await safe_send_ephemeral(interaction, "❌ Нельзя назначить автоплатеж Банка самому Банку!")
+                return
+
+            if self.bank_direction == "deposit":
+                s_acc = BANK_ACCOUNT_ID
+                r_acc = target_acc
+                dir_label = f"🟢 Начисление от Банка на `{target_acc}` ({target_user[2]})"
+                notif_text = f"🏦 Банк назначил вам автоначисление: **+{format_money(amount)}** каждые **{val} {self.unit_label}** (старт: `{next_run_str}` МСК)."
+            else:
+                s_acc = target_acc
+                r_acc = BANK_ACCOUNT_ID
+                dir_label = f"🔴 Списание в Банк со счета `{target_acc}` ({target_user[2]})"
+                notif_text = f"🏦 Банк назначил обязательное автосписание с вашего счета: **-{format_money(amount)}** каждые **{val} {self.unit_label}** (старт: `{next_run_str}` МСК)."
+
+            async with db_write_lock:
+                await db.execute(
+                    '''
+                    INSERT INTO auto_payments (owner_did, sender_acc, receiver_acc, amount, interval_val, interval_unit, next_run, is_active, is_bank)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)
+                    ''',
+                    (BANK_DISCORD_ID, s_acc, r_acc, amount, val, self.unit, next_run_str)
+                )
+                await db.commit()
+
+            if target_user[0] and target_user[0] > 0:
+                await add_notification(target_user[0], notif_text)
+
+            bank_view = await AdminBankManageView.create()
+            embed = await bank_view.build_embed()
+            await safe_edit_or_send(
+                interaction,
+                content=(
+                    f"✅ Банковский автоплатеж создан!\n"
+                    f"{dir_label}: **{format_money(amount)}** каждые **{val} {self.unit_label}**\n"
+                    f"🗓️ Первое исполнение: `{next_run_str}` (МСК){note}"
+                ),
+                embed=embed,
+                view=bank_view
+            )
+            return
+
+        # --- РЕЖИМ 2: ОБЫЧНЫЙ АВТОПЛАТЕЖ ИГРОКА ---
+        user_id = interaction.user.id
+        user_data = await get_user_data(user_id)
+        if not user_data:
+            await safe_send_ephemeral(interaction, "❌ У вас нет счета!")
+            return
+
+        if user_data[4] < 0:
+            await safe_send_ephemeral(
+                interaction,
+                f"⛔ Ваш счет заблокирован из-за задолженности (**{format_money(user_data[4])}**)! Вы не можете создавать автоплатежи до погашения долга."
+            )
+            return
+
+        sender_acc = user_data[3]
+        if target_acc == sender_acc:
+            await safe_send_ephemeral(interaction, "❌ Нельзя настроить автоплатеж самому себе!")
+            return
+
+        async with db_write_lock:
+            await db.execute(
+                '''
+                INSERT INTO auto_payments (owner_did, sender_acc, receiver_acc, amount, interval_val, interval_unit, next_run, is_active, is_bank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)
+                ''',
+                (user_id, sender_acc, target_acc, amount, val, self.unit, next_run_str)
+            )
+            await db.commit()
+
+        payments = await get_user_autopayments(user_id, sender_acc)
+        embed = build_autopayments_embed(payments, sender_acc)
         await safe_edit_or_send(
             interaction,
             content=(
-                f"✅ Автоплатеж на `{r_acc}` (**{amount}** каждые **{val} {self.unit_label}**) создан!\n"
+                f"✅ Автоплатеж на `{target_acc}` (**{format_money(amount)}** каждые **{val} {self.unit_label}**) создан!\n"
                 f"🗓️ Первое списание: `{next_run_str}` (МСК){note}"
             ),
             embed=embed,
@@ -839,7 +1363,7 @@ class AutoPaymentStepModal(Modal, title="Параметры автоплатеж
         )
 
 
-# --- ИНТЕРАКТИВНЫЙ КОНСТРУКТОР ФИЛЬТРОВ ТРАНЗАКЦИЙ (GUI БЕЗ 2 МОДАЛОК) ---
+# --- ИНТЕРАКТИВНЫЙ КОНСТРУКТОР ФИЛЬТРОВ ТРАНЗАКЦИЙ ---
 
 class FilterParamsModal(Modal, title="Дополнительные параметры"):
     def __init__(self, dashboard_view: "TransactionFilterDashboardView"):
@@ -881,8 +1405,6 @@ class FilterParamsModal(Modal, title="Дополнительные параме�
         self.add_item(self.tx_id_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         acc = self.account_input.value.strip()
         self.dashboard.filters["account"] = acc if acc else None
 
@@ -905,7 +1427,7 @@ class FilterParamsModal(Modal, title="Дополнительные параме�
 
 
 class TransactionFilterDashboardView(View):
-    """GUI-панель фильтрации транзакций с выпадающими списками вместо двух модальных окон"""
+    """GUI-панель фильтрации транзакций с выпадающими списками"""
     def __init__(self):
         super().__init__(timeout=300)
         self.filters = {
@@ -917,15 +1439,18 @@ class TransactionFilterDashboardView(View):
             "tx_id": None
         }
 
-        # Select 1: Тип операции
         self.type_select = Select(
             placeholder="📂 Выберите тип операции...",
             options=[
                 discord.SelectOption(label="Все типы операций", value="all", emoji="📋", default=True),
                 discord.SelectOption(label="Переводы игроков", value="user_transfer", emoji="💸"),
-                discord.SelectOption(label="Автоплатежи", value="auto_transfer", emoji="🔄"),
-                discord.SelectOption(label="Зачисления (Админ)", value="admin_deposit", emoji="💰"),
-                discord.SelectOption(label="Списания (Админ)", value="admin_withdraw", emoji="📉"),
+                discord.SelectOption(label="Автоплатежи игроков", value="auto_transfer", emoji="🔄"),
+                discord.SelectOption(label="Автоначисления (Банк)", value="bank_auto_deposit", emoji="🏦"),
+                discord.SelectOption(label="Автосписания (Банк)", value="bank_auto_withdraw", emoji="🏦"),
+                discord.SelectOption(label="Взносы в казну фракции", value="faction_deposit", emoji="📥"),
+                discord.SelectOption(label="Снятия из казны фракции", value="faction_withdraw", emoji="📤"),
+                discord.SelectOption(label="Зачисления (Админ/Банк)", value="admin_deposit", emoji="💰"),
+                discord.SelectOption(label="Списания (Админ/Банк)", value="admin_withdraw", emoji="📉"),
                 discord.SelectOption(label="Установка баланса", value="admin_set", emoji="⚙️"),
             ],
             row=0
@@ -933,7 +1458,6 @@ class TransactionFilterDashboardView(View):
         self.type_select.callback = self.on_type_change
         self.add_item(self.type_select)
 
-        # Select 2: Период времени
         self.period_select = Select(
             placeholder="📅 Выберите период времени...",
             options=[
@@ -951,9 +1475,13 @@ class TransactionFilterDashboardView(View):
         type_names = {
             "all": "Все операции",
             "user_transfer": "💸 Переводы игроков",
-            "auto_transfer": "🔄 Автоплатежи",
-            "admin_deposit": "💰 Зачисления (Админ)",
-            "admin_withdraw": "📉 Списания (Админ)",
+            "auto_transfer": "🔄 Автоплатежи игроков",
+            "bank_auto_deposit": "🏦 Автоначисления (Банк)",
+            "bank_auto_withdraw": "🏦 Автосписания (Банк)",
+            "faction_deposit": "📥 Взносы в казну",
+            "faction_withdraw": "📤 Снятия из казны",
+            "admin_deposit": "💰 Зачисления (Банк)",
+            "admin_withdraw": "📉 Списания (Банк)",
             "admin_set": "⚙️ Установка баланса"
         }
         period_names = {
@@ -974,19 +1502,17 @@ class TransactionFilterDashboardView(View):
 
         sum_str = "Любая"
         if self.filters["min_a"] is not None and self.filters["max_a"] is not None:
-            sum_str = f"от {self.filters['min_a']} до {self.filters['max_a']}"
+            sum_str = f"от {format_money(self.filters['min_a'])} до {format_money(self.filters['max_a'])}"
         elif self.filters["min_a"] is not None:
-            sum_str = f"от {self.filters['min_a']}"
+            sum_str = f"от {format_money(self.filters['min_a'])}"
         elif self.filters["max_a"] is not None:
-            sum_str = f"до {self.filters['max_a']}"
+            sum_str = f"до {format_money(self.filters['max_a'])}"
 
         embed.add_field(name="💰 Сумма", value=sum_str, inline=True)
         embed.add_field(name="🔢 ID транзакции", value=f"`#{self.filters['tx_id']}`" if self.filters["tx_id"] is not None else "Любой", inline=True)
         return embed
 
     async def on_type_change(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         val = self.type_select.values[0]
         self.filters["type"] = val
         for opt in self.type_select.options:
@@ -994,8 +1520,6 @@ class TransactionFilterDashboardView(View):
         await safe_edit_or_send(interaction, embed=self.build_embed(), view=self)
 
     async def on_period_change(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         val = self.period_select.values[0]
         self.filters["period"] = val
         for opt in self.period_select.options:
@@ -1008,8 +1532,6 @@ class TransactionFilterDashboardView(View):
 
     @button(label="🗑️ Сбросить", style=ButtonStyle.gray, row=2)
     async def reset_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
         self.filters = {
             "type": "all",
             "period": "all",
@@ -1026,8 +1548,6 @@ class TransactionFilterDashboardView(View):
 
     @button(label="🔎 Показать результаты", style=ButtonStyle.green, row=2)
     async def search_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
         query = "SELECT * FROM transactions WHERE 1=1"
         params = []
 
@@ -1072,11 +1592,17 @@ class TransactionFilterDashboardView(View):
             rows = await cursor.fetchall()
 
         if not rows:
-            await interaction.followup.send("❌ По заданным фильтрам транзакций не найдено.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ По заданным фильтрам транзакций не найдено.")
             return
 
         total_pages = (len(rows) - 1) // 10 + 1
         await show_transaction_page(interaction, rows, 0, total_pages, dashboard_view=self)
+
+    @button(label="🔙 В админ-панель", style=ButtonStyle.red, row=2)
+    async def back_admin_btn(self, interaction: discord.Interaction, button: Button):
+        view = await AdminPanelView.create()
+        embed = await view.build_embed()
+        await safe_edit_or_send(interaction, content=None, embed=embed, view=view)
 
 
 # --- ПАГИНАЦИЯ ТРАНЗАКЦИЙ ---
@@ -1093,27 +1619,19 @@ class TransactionPaginationView(View):
 
     @button(label="⬅️", style=ButtonStyle.secondary, row=0)
     async def prev_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
         await show_transaction_page(interaction, self.full_data, self.page - 1, self.total, self.dashboard_view)
 
     @button(label="➡️", style=ButtonStyle.secondary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
         await show_transaction_page(interaction, self.full_data, self.page + 1, self.total, self.dashboard_view)
 
     @button(label="🔍 К фильтрам", style=ButtonStyle.primary, row=0)
     async def back_to_filters_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
         view = self.dashboard_view or TransactionFilterDashboardView()
         await safe_edit_or_send(interaction, embed=view.build_embed(), view=view)
 
     @button(label="📥 Скачать CSV", style=ButtonStyle.green, row=0)
     async def export_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction, ephemeral=True):
-            return
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["ID", "Дата (МСК)", "Тип", "Отправитель", "Получатель", "Сумма"])
@@ -1123,7 +1641,7 @@ class TransactionPaginationView(View):
             fp=io.BytesIO(output.getvalue().encode('utf-8-sig')),
             filename="transactions.csv"
         )
-        await interaction.followup.send("✅ Выгрузка готова:", file=file, ephemeral=True)
+        await safe_send_ephemeral(interaction, content="✅ Выгрузка готова:", file=file)
 
 
 async def show_transaction_page(
@@ -1141,7 +1659,7 @@ async def show_transaction_page(
         label_info = TX_TYPE_LABELS.get(tx_type, (f"⚙️ {tx_type}", tx_type))
         desc += (
             f"**#{tx_id:06d}** | `{created_at}` | {label_info[0]}\n"
-            f"От: `{s_acc or 'Банк'}` ➔ Кому: `{r_acc or 'Банк'}` | Сумма: **{amount}**\n\n"
+            f"От: `{s_acc or 'Банк'}` ➔ Кому: `{r_acc or 'Банк'}` | Сумма: **{format_money(amount)}**\n\n"
         )
 
     embed = discord.Embed(
@@ -1157,19 +1675,39 @@ async def show_transaction_page(
 
 # --- ИНТЕРФЕЙСЫ ПОЛЬЗОВАТЕЛЯ ---
 
-def build_autopayments_embed(payments) -> discord.Embed:
-    desc = "**Ваши активные автоплатежи:**\n\n"
-    if not payments:
-        desc += "У вас пока нет активных автоплатежей.\nВыберите периодичность в меню ниже, чтобы создать новый."
-        color = discord.Color.greyple()
-    else:
-        for p in payments:
+def build_autopayments_embed(payments, user_acc: str) -> discord.Embed:
+    bank_payments = [p for p in payments if len(p) > 9 and p[9] == 1]
+    user_payments = [p for p in payments if len(p) <= 9 or p[9] == 0]
+
+    desc = ""
+    if bank_payments:
+        desc += "🏦 **Обязательные автоплатежи Центрального Банка** *(нельзя отменить самостоятельно)*:\n"
+        for p in bank_payments:
             u_label = UNIT_LABELS.get(p[6], p[6])
+            if p[3] == user_acc:
+                desc += (
+                    f"🟢 **Начисление от Банка**: `+{format_money(p[4])}` каждые **{p[5]} {u_label}**\n"
+                    f"⏱️ Следующее: `{p[7]}` (МСК)\n\n"
+                )
+            else:
+                desc += (
+                    f"🔴 **Списание в Банк**: `-{format_money(p[4])}` каждые **{p[5]} {u_label}**\n"
+                    f"⏱️ Следующее: `{p[7]}` (МСК)\n\n"
+                )
+
+    desc += "💸 **Ваши личные автоплатежи:**\n"
+    if not user_payments:
+        desc += "У вас пока нет личных автоплатежей.\nВыберите периодичность в меню ниже, чтобы создать новый.\n"
+    else:
+        for p in user_payments:
+            u_label = UNIT_LABELS.get(p[6], p[6])
+            target_label = f"`{p[3]}` (Казна)" if is_treasury_account(p[3]) else f"`{p[3]}`"
             desc += (
-                f"🔹 Кому: `{p[3]}` | Сумма: **{p[4]}** | Каждые **{p[5]} {u_label}**\n"
-                f"⏱️ Следующее списание: `{p[7]}`\n\n"
+                f"🔹 Кому: {target_label} | Сумма: **{format_money(p[4])}** | Каждые **{p[5]} {u_label}**\n"
+                f"⏱️ Следующее списание: `{p[7]}` (МСК)\n\n"
             )
-        color = discord.Color.orange()
+
+    color = discord.Color.orange() if payments else discord.Color.greyple()
     return discord.Embed(title="🔄 Управление автоплатежами", description=desc, color=color)
 
 
@@ -1180,8 +1718,6 @@ class NotificationsView(View):
 
     @button(label="🗑️ Очистить уведомления", style=ButtonStyle.secondary)
     async def clear_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
         user_notifications[self.user_id] = []
         user_data = await get_user_data(self.user_id)
         if not user_data:
@@ -1196,8 +1732,6 @@ class NotificationsView(View):
 
     @button(label="🔙 В профиль", style=ButtonStyle.red)
     async def back_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
         user_data = await get_user_data(self.user_id)
         if not user_data:
             return
@@ -1212,17 +1746,65 @@ class NotificationsView(View):
 
 class AutoPaymentBuilderView(View):
     """Мини-календарь и выбор времени в GUI перед открытием модального окна автоплатежа"""
-    def __init__(self, user_data, unit: str, unit_label: str):
+    def __init__(
+        self,
+        user_data,
+        unit: str = "days",
+        unit_label: str = "дн.",
+        prefill_account: str = "",
+        is_bank_mode: bool = False,
+        bank_direction: str = "withdraw"
+    ):
         super().__init__(timeout=300)
         self.user_data = user_data
         self.unit = unit
         self.unit_label = unit_label
-        self.selected_date: str = ""  # пусто = сегодня
-        self.selected_time: str = ""  # пусто = сейчас
+        self.prefill_account = prefill_account
+        self.is_bank_mode = is_bank_mode
+        self.bank_direction = bank_direction
+        self.selected_date: str = ""
+        self.selected_time: str = ""
 
         now = get_msk_now()
 
-        # Select 1: Мини-календарь на 14 дней вперед
+        if self.is_bank_mode:
+            self.dir_select = Select(
+                placeholder="🏦 Тип банковского автоплатежа...",
+                options=[
+                    discord.SelectOption(
+                        label="🔴 Списание со счета в пользу Банка (налог/кредит)",
+                        value="withdraw",
+                        emoji="📉",
+                        default=(self.bank_direction == "withdraw")
+                    ),
+                    discord.SelectOption(
+                        label="🟢 Начисление со счета Банка (зарплата/субсидия)",
+                        value="deposit",
+                        emoji="💰",
+                        default=(self.bank_direction == "deposit")
+                    ),
+                ],
+                row=0
+            )
+            self.dir_select.callback = self.on_dir_change
+            self.add_item(self.dir_select)
+
+        unit_row = 1 if self.is_bank_mode else 0
+        self.unit_select = Select(
+            placeholder="⏱️ Выберите единицу периодичности...",
+            options=[
+                discord.SelectOption(label="Каждые N минут", value="minutes", emoji="⏱️", default=(self.unit == "minutes")),
+                discord.SelectOption(label="Каждые N часов", value="hours", emoji="🕐", default=(self.unit == "hours")),
+                discord.SelectOption(label="Каждые N дней", value="days", emoji="📅", default=(self.unit == "days")),
+                discord.SelectOption(label="Каждые N недель", value="weeks", emoji="🗓️", default=(self.unit == "weeks")),
+                discord.SelectOption(label="Каждые N месяцев (30 дн.)", value="months", emoji="📆", default=(self.unit == "months")),
+                discord.SelectOption(label="Каждые N секунд (тест)", value="seconds", emoji="⚡", default=(self.unit == "seconds")),
+            ],
+            row=unit_row
+        )
+        self.unit_select.callback = self.on_unit_change
+        self.add_item(self.unit_select)
+
         date_options = [
             discord.SelectOption(
                 label="Авто (Сегодня / Завтра если время прошло)",
@@ -1244,13 +1826,8 @@ class AutoPaymentBuilderView(View):
                 lbl = f"Послезавтра — {d_str} ({wd})"
             else:
                 lbl = f"{d_str} ({wd})"
-            date_options.append(
-                discord.SelectOption(
-                    label=lbl,
-                    value=d_str,
-                    emoji="🗓️"
-                )
-            )
+            date_options.append(discord.SelectOption(label=lbl, value=d_str, emoji="🗓️"))
+
         date_options.append(
             discord.SelectOption(
                 label="Ввести другую дату вручную...",
@@ -1260,15 +1837,15 @@ class AutoPaymentBuilderView(View):
             )
         )
 
+        date_row = 2 if self.is_bank_mode else 1
         self.date_select = Select(
-            placeholder="📅 Выберите дату первого списания...",
+            placeholder="📅 Выберите дату первого исполнения...",
             options=date_options,
-            row=0
+            row=date_row
         )
         self.date_select.callback = self.on_date_change
         self.add_item(self.date_select)
 
-        # Select 2: Быстрый выбор времени (МСК)
         time_slots = [
             ("Сейчас (текущее время)", "", "⚡"),
             ("00:00 (Полночь)", "00:00", "🕛"),
@@ -1297,91 +1874,111 @@ class AutoPaymentBuilderView(View):
             for lbl, val, emj in time_slots
         ]
 
+        time_row = 3 if self.is_bank_mode else 2
         self.time_select = Select(
-            placeholder="🕒 Выберите время первого списания (МСК)...",
+            placeholder="🕒 Выберите время первого исполнения (МСК)...",
             options=time_options,
-            row=1
+            row=time_row
         )
         self.time_select.callback = self.on_time_change
         self.add_item(self.time_select)
+
+        btn_row = 4 if self.is_bank_mode else 3
+        open_btn = Button(label="✍️ Ввести счет, сумму и интервал", style=ButtonStyle.green, row=btn_row)
+        open_btn.callback = self.open_modal_btn
+        self.add_item(open_btn)
+
+        back_btn = Button(label="🔙 Назад", style=ButtonStyle.red, row=btn_row)
+        back_btn.callback = self.back_to_list_btn
+        self.add_item(back_btn)
 
     def build_embed(self) -> discord.Embed:
         now = get_msk_now()
         d_display = self.selected_date if self.selected_date else f"Сегодня ({now.strftime('%d.%m.%Y')}) / Авто"
         t_display = self.selected_time if self.selected_time else f"Сейчас ({now.strftime('%H:%M')} МСК)"
 
+        if self.is_bank_mode:
+            title = "🏦 Конструктор автоплатежа Центрального Банка"
+            dir_str = "🔴 Списание со счета в Банк" if self.bank_direction == "withdraw" else "🟢 Начисление со счета Банка"
+            color = discord.Color.gold()
+        else:
+            title = f"🗓️ Настройка автоплатежа (Интервал: в {self.unit_label})"
+            dir_str = "💸 Личный автоплатеж"
+            color = discord.Color.blurple()
+
         embed = discord.Embed(
-            title=f"🗓️ Настройка автоплатежа (Интервал: в {self.unit_label})",
+            title=title,
             description=(
-                "Выберите **дату** и **время** первого списания в списках ниже (или оставьте по умолчанию), "
-                "затем нажмите зеленую кнопку **«Ввести счет и сумму»**.\n\n"
-                "💡 *В открывшемся окне вы также сможете подкорректировать дату и время вручную или оставить их пустыми.*"
+                "Настройте параметры в выпадающих списках ниже, "
+                "затем нажмите зеленую кнопку **«Ввести счет, сумму и интервал»**."
             ),
-            color=discord.Color.blurple()
+            color=color
         )
-        embed.add_field(name="⏱️ Единица интервала", value=f"Каждые **N {self.unit_label}**", inline=True)
-        embed.add_field(name="📅 Дата 1-го списания", value=f"`{d_display}`", inline=True)
-        embed.add_field(name="🕒 Время 1-го списания", value=f"`{t_display}`", inline=True)
+        embed.add_field(name="📂 Тип", value=dir_str, inline=True)
+        embed.add_field(name="⏱️ Периодичность", value=f"Каждые **N {self.unit_label}**", inline=True)
+        if self.prefill_account:
+            embed.add_field(name="💳 Целевой счет", value=f"`{self.prefill_account}`", inline=True)
+        embed.add_field(name="📅 Дата 1-го исполнения", value=f"`{d_display}`", inline=True)
+        embed.add_field(name="🕒 Время 1-го исполнения", value=f"`{t_display}`", inline=True)
         return embed
 
-    async def on_date_change(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
-        val = self.date_select.values[0]
-        if val in ("today_auto", "manual"):
-            self.selected_date = ""
-        else:
-            self.selected_date = val
+    async def on_dir_change(self, interaction: discord.Interaction):
+        val = self.dir_select.values[0]
+        self.bank_direction = val
+        for opt in self.dir_select.options:
+            opt.default = (opt.value == val)
+        await safe_edit_or_send(interaction, content=None, embed=self.build_embed(), view=self)
 
+    async def on_unit_change(self, interaction: discord.Interaction):
+        val = self.unit_select.values[0]
+        self.unit = val
+        self.unit_label = UNIT_LABELS.get(val, val)
+        for opt in self.unit_select.options:
+            opt.default = (opt.value == val)
+        await safe_edit_or_send(interaction, content=None, embed=self.build_embed(), view=self)
+
+    async def on_date_change(self, interaction: discord.Interaction):
+        val = self.date_select.values[0]
+        self.selected_date = "" if val in ("today_auto", "manual") else val
         for opt in self.date_select.options:
             opt.default = (opt.value == val)
-
         await safe_edit_or_send(interaction, content=None, embed=self.build_embed(), view=self)
 
     async def on_time_change(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         val = self.time_select.values[0]
-        if val in ("now", "manual"):
-            self.selected_time = ""
-        else:
-            self.selected_time = val
-
+        self.selected_time = "" if val in ("now", "manual") else val
         for opt in self.time_select.options:
             opt.default = (opt.value == val)
-
         await safe_edit_or_send(interaction, content=None, embed=self.build_embed(), view=self)
 
-    @button(label="✍️ Ввести счет и сумму", style=ButtonStyle.green, row=2)
-    async def open_modal_btn(self, interaction: discord.Interaction, button: Button):
+    async def open_modal_btn(self, interaction: discord.Interaction):
         await safe_send_modal(
             interaction,
             AutoPaymentStepModal(
                 self.unit,
                 self.unit_label,
                 prefill_date=self.selected_date,
-                prefill_time=self.selected_time
+                prefill_time=self.selected_time,
+                prefill_account=self.prefill_account,
+                is_bank_mode=self.is_bank_mode,
+                bank_direction=self.bank_direction
             )
         )
 
-    @button(label="🔙 Назад к автоплатежам", style=ButtonStyle.red, row=2)
-    async def back_to_list_btn(self, interaction: discord.Interaction, button: Button):
-        if not await safe_defer(interaction):
-            return
-        db = await get_db()
-        async with db.execute(
-            "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
-            (self.user_data[0],)
-        ) as cur:
-            payments = await cur.fetchall()
-
-        embed = build_autopayments_embed(payments)
-        await safe_edit_or_send(
-            interaction,
-            content=None,
-            embed=embed,
-            view=AutoPaymentsListView(self.user_data, payments)
-        )
+    async def back_to_list_btn(self, interaction: discord.Interaction):
+        if self.is_bank_mode:
+            bank_view = await AdminBankManageView.create()
+            embed = await bank_view.build_embed()
+            await safe_edit_or_send(interaction, content=None, embed=embed, view=bank_view)
+        else:
+            payments = await get_user_autopayments(self.user_data[0], self.user_data[3])
+            embed = build_autopayments_embed(payments, self.user_data[3])
+            await safe_edit_or_send(
+                interaction,
+                content=None,
+                embed=embed,
+                view=AutoPaymentsListView(self.user_data, payments)
+            )
 
 
 class AutoPaymentsListView(View):
@@ -1391,7 +1988,7 @@ class AutoPaymentsListView(View):
         self.payments = payments_list
 
         unit_select = Select(
-            placeholder="➕ Создать автоплатеж: выберите периодичность...",
+            placeholder="➕ Создать личный автоплатеж: выберите периодичность...",
             options=[
                 discord.SelectOption(label="Каждые N минут", value="minutes", emoji="⏱️"),
                 discord.SelectOption(label="Каждые N часов", value="hours", emoji="🕐"),
@@ -1405,16 +2002,17 @@ class AutoPaymentsListView(View):
         unit_select.callback = self.create_unit_selected
         self.add_item(unit_select)
 
-        if payments_list:
+        deletable_payments = [p for p in payments_list if len(p) <= 9 or p[9] == 0]
+        if deletable_payments:
             options = []
-            for p in payments_list[:25]:
+            for p in deletable_payments[:25]:
                 u_label = UNIT_LABELS.get(p[6], p[6])
-                label = f"На счет {p[3]} ({p[4]} монет)"
+                label = f"На счет {p[3]} ({format_money(p[4])} монет)"
                 desc = f"Каждые {p[5]} {u_label} | След: {p[7][:16]}"
                 options.append(discord.SelectOption(label=label, description=desc, value=str(p[0]), emoji="🗑️"))
 
             delete_select = Select(
-                placeholder="🗑️ Выберите автоплатеж для удаления...",
+                placeholder="🗑️ Выберите личный автоплатеж для удаления...",
                 options=options,
                 row=1
             )
@@ -1426,7 +2024,11 @@ class AutoPaymentsListView(View):
         self.add_item(back_btn)
 
     async def create_unit_selected(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
+        if self.user_data[4] < 0:
+            await safe_send_ephemeral(
+                interaction,
+                f"⛔ Ваш счет заблокирован из-за задолженности (**{format_money(self.user_data[4])}**)! Погасите долг для создания автоплатежей."
+            )
             return
         unit = interaction.data['values'][0]
         unit_label = UNIT_LABELS.get(unit, unit)
@@ -1439,8 +2041,6 @@ class AutoPaymentsListView(View):
         )
 
     async def back_callback(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         fresh_data = await get_user_data(self.user_data[0]) or self.user_data
         is_leader = check_is_leader(interaction)
         await safe_edit_or_send(
@@ -1453,39 +2053,41 @@ class AutoPaymentsListView(View):
     async def delete_callback(self, interaction: discord.Interaction):
         if not interaction.data.get('values'):
             return
-        if not await safe_defer(interaction):
-            return
         try:
             ap_id = int(interaction.data['values'][0])
         except ValueError:
-            await interaction.followup.send("❌ Ошибка ID.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Ошибка ID.")
             return
 
         db = await get_db()
         async with db_write_lock:
-            await db.execute("DELETE FROM auto_payments WHERE id = ? AND owner_did = ?", (ap_id, self.user_data[0]))
+            await db.execute(
+                "DELETE FROM auto_payments WHERE id = ? AND owner_did = ? AND COALESCE(is_bank, 0) = 0",
+                (ap_id, self.user_data[0])
+            )
             await db.commit()
-            async with db.execute(
-                "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
-                (self.user_data[0],)
-            ) as cur:
-                new_list = await cur.fetchall()
 
-        embed = build_autopayments_embed(new_list)
+        new_list = await get_user_autopayments(self.user_data[0], self.user_data[3])
+        embed = build_autopayments_embed(new_list, self.user_data[3])
         await safe_edit_or_send(
             interaction,
-            content="🗑️ Автоплатеж удален.",
+            content="🗑️ Личный автоплатеж удален.",
             embed=embed,
             view=AutoPaymentsListView(self.user_data, new_list)
         )
 
 
 class FactionView(View):
-    """Меню фракции с быстрым переводом участнику через выпадающий список"""
-    def __init__(self, user_data, members):
+    """Меню фракции с казной (пополнение для всех, снятие для Лидера), автоплатежом в казну и быстрым переводом участникам"""
+    def __init__(self, user_data, members, treasury_data, is_leader: bool = False):
         super().__init__(timeout=600)
         self.user_data = user_data
-        self.members = [m for m in members if m[0] != user_data[0]]
+        self.prefix = user_data[5] if len(user_data) > 5 and user_data[5] else str(user_data[3])[:2]
+        self.treasury_data = treasury_data
+        self.treasury_acc = get_treasury_account_id(self.prefix)
+        self.is_leader = is_leader
+        self.members = [m for m in members if m[0] != user_data[0] and m[0] > 0]
+        is_user_blocked = user_data[4] < 0
 
         if self.members:
             options = []
@@ -1501,29 +2103,111 @@ class FactionView(View):
             member_select = Select(
                 placeholder="💸 Быстрый перевод участнику фракции...",
                 options=options,
-                row=0
+                row=0,
+                disabled=is_user_blocked
             )
             member_select.callback = self.quick_transfer_cb
             self.add_item(member_select)
 
-        back_btn = Button(label="🔙 В профиль", style=ButtonStyle.red, row=1)
+        dep_btn = Button(label="📥 Пополнить казну", style=ButtonStyle.green, row=1, disabled=is_user_blocked)
+        dep_btn.callback = self.deposit_treasury_cb
+        self.add_item(dep_btn)
+
+        if self.is_leader:
+            with_btn = Button(label="📤 Снять из казны", style=ButtonStyle.primary, row=1)
+            with_btn.callback = self.withdraw_treasury_cb
+            self.add_item(with_btn)
+
+        auto_fac_btn = Button(label="🔄 Автоплатеж в казну", style=ButtonStyle.secondary, row=1, disabled=is_user_blocked)
+        auto_fac_btn.callback = self.auto_treasury_cb
+        self.add_item(auto_fac_btn)
+
+        back_btn = Button(label="🔙 В профиль", style=ButtonStyle.red, row=2)
         back_btn.callback = self.back_cb
         self.add_item(back_btn)
 
-        tr_btn = Button(label="💸 Перевод по номеру счета", style=ButtonStyle.blurple, row=1)
-        tr_btn.callback = self.manual_transfer_cb
-        self.add_item(tr_btn)
+    def build_embed(self, all_members) -> discord.Embed:
+        t_bal = self.treasury_data[4] if self.treasury_data else 0
+        t_status = f"⛔ **{format_money(t_bal)}** (Заблокирована / Долг)" if t_bal < 0 else f"💰 **{format_money(t_bal)}**"
+
+        embed = discord.Embed(
+            title=f"🛡️ Фракция #{self.prefix} — Общая Казна и Состав",
+            description=(
+                f"🏦 **Счет казны фракции:** `{self.treasury_acc}`\n"
+                f"💎 **Баланс казны:** {t_status}\n"
+                f"💳 **Ваш личный баланс:** **{format_money(self.user_data[4])}**\n\n"
+                f"Каждый участник может пополнить казну или настроить автоплатеж в казну. "
+                f"{'Вы как **Лидер Фракции** также можете снимать средства из казны.' if self.is_leader else ''}"
+            ),
+            color=discord.Color.blue() if t_bal >= 0 else discord.Color.dark_red()
+        )
+
+        real_members = [m for m in all_members if m[0] > 0]
+        for m in real_members[:24]:
+            me_tag = " *(Вы)*" if m[0] == self.user_data[0] else ""
+            embed.add_field(
+                name=f"👤 {m[2]}{me_tag}",
+                value=f"💳 `{m[3]}`\n📛 {m[1]}",
+                inline=True
+            )
+        return embed
+
+    async def refresh_view(self, interaction: discord.Interaction, status_text: str | None = None):
+        fresh_user = await get_user_data(interaction.user.id) or self.user_data
+        fresh_treasury = await get_faction_treasury_data(self.prefix)
+        members = await get_faction_members(self.prefix)
+        is_leader = check_is_leader(interaction)
+
+        new_view = FactionView(fresh_user, members, fresh_treasury, is_leader=is_leader)
+        embed = new_view.build_embed(members)
+        await safe_edit_or_send(interaction, content=status_text, embed=embed, view=new_view)
+
+    async def deposit_treasury_cb(self, interaction: discord.Interaction):
+        if self.user_data[4] < 0:
+            await safe_send_ephemeral(
+                interaction,
+                f"⛔ Ваш счет заблокирован из-за задолженности (**{format_money(self.user_data[4])}**)! Сначала погасите долг."
+            )
+            return
+        await safe_send_modal(interaction, FactionTreasuryModal("deposit", self.prefix, self))
+
+    async def withdraw_treasury_cb(self, interaction: discord.Interaction):
+        if not check_is_leader(interaction):
+            await safe_send_ephemeral(interaction, "❌ Снимать средства из казны может только Лидер Фракции!")
+            return
+        await safe_send_modal(interaction, FactionTreasuryModal("withdraw", self.prefix, self))
+
+    async def auto_treasury_cb(self, interaction: discord.Interaction):
+        if self.user_data[4] < 0:
+            await safe_send_ephemeral(
+                interaction,
+                f"⛔ Ваш счет заблокирован из-за задолженности (**{format_money(self.user_data[4])}**)! Вы не можете создавать автоплатежи."
+            )
+            return
+        builder = AutoPaymentBuilderView(
+            self.user_data,
+            unit="days",
+            unit_label="дн.",
+            prefill_account=self.treasury_acc
+        )
+        await safe_edit_or_send(
+            interaction,
+            content=f"🛡️ *Счет казны вашей фракции (`{self.treasury_acc}`) автоматически подставлен в качестве получателя.*",
+            embed=builder.build_embed(),
+            view=builder
+        )
 
     async def quick_transfer_cb(self, interaction: discord.Interaction):
+        if self.user_data[4] < 0:
+            await safe_send_ephemeral(
+                interaction,
+                f"⛔ Ваш счет заблокирован из-за задолженности (**{format_money(self.user_data[4])}**)! Переводы недоступны."
+            )
+            return
         target_acc = interaction.data['values'][0]
         await safe_send_modal(interaction, TransferModal(prefill_target=target_acc))
 
-    async def manual_transfer_cb(self, interaction: discord.Interaction):
-        await safe_send_modal(interaction, TransferModal())
-
     async def back_cb(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         fresh_data = await get_user_data(self.user_data[0]) or self.user_data
         is_leader = check_is_leader(interaction)
         await safe_edit_or_send(
@@ -1538,8 +2222,9 @@ class UserProfileView(View):
     def __init__(self, user_data, is_leader: bool = False):
         super().__init__(timeout=900)
         self.user_data = user_data
+        is_blocked = user_data[4] < 0
 
-        tr_btn = Button(label="💸 Перевод", style=ButtonStyle.blurple, row=0)
+        tr_btn = Button(label="💸 Перевод", style=ButtonStyle.blurple, row=0, disabled=is_blocked)
         tr_btn.callback = self.transfer_callback
         self.add_item(tr_btn)
 
@@ -1547,10 +2232,9 @@ class UserProfileView(View):
         auto_btn.callback = self.auto_callback
         self.add_item(auto_btn)
 
-        if is_leader:
-            fac_btn = Button(label="👥 Фракция", style=ButtonStyle.green, row=0)
-            fac_btn.callback = self.faction_callback
-            self.add_item(fac_btn)
+        fac_btn = Button(label="👥 Фракция и Казна", style=ButtonStyle.green, row=0)
+        fac_btn.callback = self.faction_callback
+        self.add_item(fac_btn)
 
         notif_count = len([n for n in user_notifications.get(self.user_data[0], []) if not n['read']])
         label = f"🔔 Уведомления ({notif_count})" if notif_count > 0 else "🔔 Уведомления"
@@ -1564,8 +2248,6 @@ class UserProfileView(View):
         self.add_item(refresh_btn)
 
     async def refresh_callback(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         fresh_data = await get_user_data(interaction.user.id)
         if not fresh_data:
             return
@@ -1579,35 +2261,29 @@ class UserProfileView(View):
         )
 
     async def transfer_callback(self, interaction: discord.Interaction):
+        if self.user_data[4] < 0:
+            await safe_send_ephemeral(
+                interaction,
+                f"⛔ Ваш счет заблокирован из-за задолженности (**{format_money(self.user_data[4])}**)! Пополните баланс для разблокировки."
+            )
+            return
         await safe_send_modal(interaction, TransferModal())
 
     async def auto_callback(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
-        db = await get_db()
-        async with db.execute(
-            "SELECT * FROM auto_payments WHERE owner_did = ? ORDER BY next_run ASC",
-            (self.user_data[0],)
-        ) as cur:
-            payments = await cur.fetchall()
-
-        embed = build_autopayments_embed(payments)
+        fresh_data = await get_user_data(interaction.user.id) or self.user_data
+        payments = await get_user_autopayments(fresh_data[0], fresh_data[3])
+        embed = build_autopayments_embed(payments, fresh_data[3])
         await safe_edit_or_send(
             interaction,
             content=None,
             embed=embed,
-            view=AutoPaymentsListView(self.user_data, payments)
+            view=AutoPaymentsListView(fresh_data, payments)
         )
 
     async def notif_callback(self, interaction: discord.Interaction):
         notes = user_notifications.get(self.user_data[0], [])
         if not notes:
-            if not await safe_defer(interaction, ephemeral=True):
-                return
-            await interaction.followup.send("🔕 У вас пока нет уведомлений.", ephemeral=True)
-            return
-
-        if not await safe_defer(interaction):
+            await safe_send_ephemeral(interaction, "🔕 У вас пока нет уведомлений.")
             return
 
         desc = ""
@@ -1628,47 +2304,157 @@ class UserProfileView(View):
         )
 
     async def faction_callback(self, interaction: discord.Interaction):
-        if not check_is_leader(interaction):
-            if not await safe_defer(interaction, ephemeral=True):
-                return
-            await interaction.followup.send("❌ Доступ запрещен.", ephemeral=True)
-            return
-
-        if not await safe_defer(interaction):
-            return
-
-        my_prefix = self.user_data[5] if len(self.user_data) > 5 and self.user_data[5] else str(self.user_data[3])[:2]
+        fresh_user = await get_user_data(interaction.user.id) or self.user_data
+        my_prefix = fresh_user[5] if len(fresh_user) > 5 and fresh_user[5] else str(fresh_user[3])[:2]
+        treasury_data = await get_faction_treasury_data(my_prefix)
         members = await get_faction_members(my_prefix)
-        other_members = [m for m in members if m[0] != self.user_data[0]]
+        is_leader = check_is_leader(interaction)
 
-        if not other_members:
-            await interaction.followup.send(f"ℹ️ В вашей фракции (`{my_prefix}`) пока нет других участников.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title=f"🛡️ Участники фракции (Код: {my_prefix})",
-            description="Вы можете быстро перевести средства участнику, выбрав его в списке ниже.",
-            color=discord.Color.blue()
-        )
-        for m in other_members[:25]:
-            embed.add_field(
-                name=f"👤 {m[2]}",
-                value=f"💳 `{m[3]}`\n📛 {m[1]}",
-                inline=True
-            )
+        fac_view = FactionView(fresh_user, members, treasury_data, is_leader=is_leader)
+        embed = fac_view.build_embed(members)
 
         await safe_edit_or_send(
             interaction,
             content=None,
             embed=embed,
-            view=FactionView(self.user_data, members)
+            view=fac_view
         )
 
 
-# --- АДМИН-ПАНЕЛЬ И УПРАВЛЕНИЕ ИГРОКАМИ ---
+# --- АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ ЦЕНТРАЛЬНЫМ БАНКОМ И АВТОПЛАТЕЖАМИ БАНКА ---
+
+class AdminBankManageView(View):
+    """Панель управления счетом самого Банка (0000000000) и всеми банковскими автоплатежами"""
+    def __init__(self, bank_payments):
+        super().__init__(timeout=600)
+        self.bank_payments = bank_payments
+
+        if bank_payments:
+            options = []
+            for p in bank_payments[:25]:
+                pay_id, owner_did, s_acc, r_acc, amount, i_val, i_unit, next_run_str, is_active, is_bank = p
+                u_label = UNIT_LABELS.get(i_unit, i_unit)
+                if s_acc == BANK_ACCOUNT_ID:
+                    lbl = f"[Начисление] ➔ {r_acc} (+{format_money(amount)})"
+                    emj = "🟢"
+                else:
+                    lbl = f"[Списание] с {s_acc} (-{format_money(amount)})"
+                    emj = "🔴"
+                desc = f"Каждые {i_val} {u_label} | След: {next_run_str[:16]}"
+                options.append(discord.SelectOption(label=lbl[:100], description=desc[:100], value=str(pay_id), emoji=emj))
+
+            del_select = Select(
+                placeholder="🗑️ Выберите автоплатеж Банка для отмены...",
+                options=options,
+                row=0
+            )
+            del_select.callback = self.delete_bank_ap_cb
+            self.add_item(del_select)
+
+    @classmethod
+    async def create(cls):
+        db = await get_db()
+        async with db.execute(
+            '''
+            SELECT id, owner_did, sender_acc, receiver_acc, amount, interval_val, interval_unit, next_run, is_active, COALESCE(is_bank, 0)
+            FROM auto_payments
+            WHERE is_active = 1 AND COALESCE(is_bank, 0) = 1
+            ORDER BY next_run ASC
+            '''
+        ) as cur:
+            rows = await cur.fetchall()
+        return cls(bank_payments=rows)
+
+    async def build_embed(self) -> discord.Embed:
+        bank_bal = await get_bank_balance()
+        desc = (
+            f"💳 **Номер счета Банка:** `{BANK_ACCOUNT_ID}`\n"
+            f"💰 **Капитал Банка:** **{format_money(bank_bal)}**\n\n"
+            f"**Активные автоплатежи от имени Банка ({len(self.bank_payments)}):**\n"
+        )
+        if not self.bank_payments:
+            desc += "*Активных банковских автоплатежей пока нет.*\n"
+        else:
+            for p in self.bank_payments[:15]:
+                pay_id, owner_did, s_acc, r_acc, amount, i_val, i_unit, next_run_str, is_active, is_bank = p
+                u_label = UNIT_LABELS.get(i_unit, i_unit)
+                if s_acc == BANK_ACCOUNT_ID:
+                    desc += f"🟢 **#{pay_id}** | Начисление на `{r_acc}`: **+{format_money(amount)}** каждые **{i_val} {u_label}** (След: `{next_run_str}`)\n"
+                else:
+                    desc += f"🔴 **#{pay_id}** | Списание со счета `{s_acc}`: **-{format_money(amount)}** каждые **{i_val} {u_label}** (След: `{next_run_str}`)\n"
+
+        embed = discord.Embed(
+            title="🏦 Центральный Банк — Казна и Автоплатежи",
+            description=desc,
+            color=discord.Color.gold()
+        )
+        return embed
+
+    async def delete_bank_ap_cb(self, interaction: discord.Interaction):
+        if not check_is_admin(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
+            return
+        ap_id = int(interaction.data['values'][0])
+        db = await get_db()
+        async with db_write_lock:
+            await db.execute("DELETE FROM auto_payments WHERE id = ? AND COALESCE(is_bank, 0) = 1", (ap_id,))
+            await db.commit()
+
+        new_view = await AdminBankManageView.create()
+        embed = await new_view.build_embed()
+        await safe_edit_or_send(
+            interaction,
+            content=f"🗑️ Банковский автоплатеж **#{ap_id}** отменен сотрудником банка.",
+            embed=embed,
+            view=new_view
+        )
+
+    @button(label="➕ Создать автоплатеж Банка", style=ButtonStyle.blurple, row=1)
+    async def create_bank_ap_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
+            return
+        builder = AutoPaymentBuilderView(
+            user_data=None,
+            unit="days",
+            unit_label="дн.",
+            is_bank_mode=True,
+            bank_direction="withdraw"
+        )
+        await safe_edit_or_send(interaction, content=None, embed=builder.build_embed(), view=builder)
+
+    @button(label="➕ Пополнить Банк", style=ButtonStyle.green, row=2)
+    async def bank_add_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
+            return
+        await safe_send_modal(interaction, ManageBalanceModal("add", prefill_account=BANK_ACCOUNT_ID))
+
+    @button(label="➖ Списать из Банка", style=ButtonStyle.red, row=2)
+    async def bank_remove_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
+            return
+        await safe_send_modal(interaction, ManageBalanceModal("remove", prefill_account=BANK_ACCOUNT_ID))
+
+    @button(label="⚙️ Установить баланс Банка", style=ButtonStyle.secondary, row=2)
+    async def bank_set_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
+            return
+        await safe_send_modal(interaction, ManageBalanceModal("set", prefill_account=BANK_ACCOUNT_ID))
+
+    @button(label="🔙 В админ-панель", style=ButtonStyle.gray, row=3)
+    async def back_admin_btn(self, interaction: discord.Interaction, button: Button):
+        view = await AdminPanelView.create()
+        embed = await view.build_embed()
+        await safe_edit_or_send(interaction, content=None, embed=embed, view=view)
+
+
+# --- АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ КОНКРЕТНЫМ ИГРОКОМ / СЧЕТОМ ---
 
 class AdminUserManageView(View):
-    """Карточка управления конкретным игроком в админ-панели (без ручного ввода 10 цифр счета)"""
+    """Карточка управления конкретным игроком или казной в админ-панели"""
     def __init__(self, target_user_data):
         super().__init__(timeout=300)
         self.u_data = target_user_data
@@ -1676,34 +2462,48 @@ class AdminUserManageView(View):
     @button(label="➕ Зачислить", style=ButtonStyle.green, row=0)
     async def add_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         await safe_send_modal(interaction, ManageBalanceModal("add", prefill_account=self.u_data[3]))
 
     @button(label="➖ Списать", style=ButtonStyle.red, row=0)
     async def remove_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         await safe_send_modal(interaction, ManageBalanceModal("remove", prefill_account=self.u_data[3]))
 
     @button(label="⚙️ Установить", style=ButtonStyle.blurple, row=0)
     async def set_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         await safe_send_modal(interaction, ManageBalanceModal("set", prefill_account=self.u_data[3]))
 
-    @button(label="📜 Транзакции игрока", style=ButtonStyle.secondary, row=1)
+    @button(label="🏦 Назначить автоплатеж Банка", style=ButtonStyle.primary, row=1)
+    async def bank_ap_for_user_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
+            return
+        builder = AutoPaymentBuilderView(
+            user_data=None,
+            unit="days",
+            unit_label="дн.",
+            prefill_account=self.u_data[3],
+            is_bank_mode=True,
+            bank_direction="withdraw"
+        )
+        await safe_edit_or_send(
+            interaction,
+            content=f"🏦 *Настройка банковского автоплатежа для счета `{self.u_data[3]}` (**{self.u_data[2]}**).*",
+            embed=builder.build_embed(),
+            view=builder
+        )
+
+    @button(label="📜 Транзакции счета", style=ButtonStyle.secondary, row=1)
     async def user_tx_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
-            return
-        if not await safe_defer(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         acc = self.u_data[3]
         db = await get_db()
@@ -1713,43 +2513,35 @@ class AdminUserManageView(View):
         ) as cur:
             rows = await cur.fetchall()
         if not rows:
-            await interaction.followup.send("ℹ️ У этого счета пока нет транзакций.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "ℹ️ У этого счета пока нет транзакций.")
             return
         total_pages = (len(rows) - 1) // 10 + 1
         await show_transaction_page(interaction, rows, 0, total_pages)
 
-    @button(label="🔙 В админ-панель", style=ButtonStyle.gray, row=1)
+    @button(label="🔙 В админ-панель", style=ButtonStyle.gray, row=2)
     async def back_admin_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
-        if not await safe_defer(interaction):
-            return
-        embed = discord.Embed(
-            title="🛡️ Панель Администратора",
-            description="Выберите действие или найдите игрока в списке ниже.",
-            color=discord.Color.red()
-        )
-        await safe_edit_or_send(interaction, embed=embed, view=await AdminPanelView.create())
+        view = await AdminPanelView.create()
+        embed = await view.build_embed()
+        await safe_edit_or_send(interaction, content=None, embed=embed, view=view)
 
 
-class AdminSearchModal(Modal, title="Поиск счета / игрока"):
+class AdminSearchModal(Modal, title="Поиск счета / игрока / казны"):
     def __init__(self):
         super().__init__()
         self.query_input = TextInput(
             label="Ник, Discord-тег или номер счета",
-            placeholder="Введите часть ника или номера счета...",
+            placeholder="Введите часть ника, номера счета или 0100000000...",
             required=True,
             max_length=32
         )
         self.add_item(self.query_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not await safe_defer(interaction):
-            return
         if not check_is_admin(interaction):
-            await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         q = self.query_input.value.strip()
         q_escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -1762,30 +2554,35 @@ class AdminSearchModal(Modal, title="Поиск счета / игрока"):
             rows = await cur.fetchall()
 
         if not rows:
-            await interaction.followup.send(f"❌ По запросу `{q}` никого не найдено.", ephemeral=True)
+            await safe_send_ephemeral(interaction, f"❌ По запросу `{q}` никого не найдено.")
             return
 
         if len(rows) == 1:
             u = rows[0]
+            if u[3] == BANK_ACCOUNT_ID:
+                bank_view = await AdminBankManageView.create()
+                await safe_edit_or_send(interaction, embed=await bank_view.build_embed(), view=bank_view)
+                return
             embed = build_admin_user_embed(u)
             await safe_edit_or_send(interaction, embed=embed, view=AdminUserManageView(u))
             return
 
-        embed = discord.Embed(
-            title=f"🔎 Результаты поиска: {q}",
-            description="Выберите игрока из выпадающего списка ниже для управления его счетом.",
-            color=discord.Color.blurple()
-        )
-        await safe_edit_or_send(interaction, embed=embed, view=AdminPanelView(users_list=rows))
+        view = AdminPanelView(users_list=rows)
+        embed = await view.build_embed(custom_title=f"🔎 Результаты поиска: {q}")
+        await safe_edit_or_send(interaction, embed=embed, view=view)
 
 
 def build_admin_user_embed(u) -> discord.Embed:
-    embed = discord.Embed(title=f"👤 Управление счетом: {u[2]}", color=discord.Color.gold())
-    embed.add_field(name="Discord", value=f"{u[1]} (`{u[0]}`)", inline=True)
-    embed.add_field(name="Игровой ник", value=u[2], inline=True)
+    bal = u[4]
+    is_blocked = bal < 0
+    color = discord.Color.dark_red() if is_blocked else discord.Color.gold()
+    title_prefix = "⛔ [ЗАБЛОКИРОВАН] " if is_blocked else "👤 "
+    embed = discord.Embed(title=f"{title_prefix}Управление счетом: {u[2]}", color=color)
+    embed.add_field(name="Владелец / Тег", value=f"{u[1]} (`{u[0]}`)", inline=True)
+    embed.add_field(name="Название / Ник", value=u[2], inline=True)
     embed.add_field(name="Фракция", value=f"`{u[5]}`", inline=True)
     embed.add_field(name="Номер счета", value=f"`{u[3]}`", inline=True)
-    embed.add_field(name="Баланс", value=f"**{u[4]:,}**".replace(",", " "), inline=True)
+    embed.add_field(name="Баланс", value=f"**{format_money(bal)}**", inline=True)
     return embed
 
 
@@ -1797,88 +2594,125 @@ class AdminPanelView(View):
         if self.users_list:
             options = []
             for u in self.users_list[:25]:
+                if u[3] == BANK_ACCOUNT_ID:
+                    continue
+                emj = "🛡️" if is_treasury_account(u[3]) else ("⛔" if u[4] < 0 else "👤")
                 options.append(
                     discord.SelectOption(
-                        label=f"{u[2]} | Счет: {u[3]}",
-                        description=f"Баланс: {u[4]} | Discord: {u[1]}",
+                        label=f"{u[2]} | {u[3]}"[:100],
+                        description=f"Баланс: {format_money(u[4])} | Фракция: {u[5]}"[:100],
                         value=str(u[3]),
-                        emoji="👤"
+                        emoji=emj
                     )
                 )
-            user_select = Select(
-                placeholder="👤 Выберите игрока для управления балансом...",
-                options=options,
-                row=0
-            )
-            user_select.callback = self.select_user_cb
-            self.add_item(user_select)
+            if options:
+                user_select = Select(
+                    placeholder="👤 Выберите счет игрока или казны фракции...",
+                    options=options,
+                    row=0
+                )
+                user_select.callback = self.select_user_cb
+                self.add_item(user_select)
 
     @classmethod
     async def create(cls):
         db = await get_db()
-        async with db.execute("SELECT * FROM users ORDER BY balance DESC LIMIT 25") as cur:
+        async with db.execute(
+            "SELECT * FROM users WHERE account_id != ? ORDER BY CASE WHEN discord_id < 0 THEN 0 ELSE 1 END, balance DESC LIMIT 25",
+            (BANK_ACCOUNT_ID,)
+        ) as cur:
             users = await cur.fetchall()
         return cls(users_list=users)
 
+    async def build_embed(self, custom_title: str | None = None) -> discord.Embed:
+        bank_bal = await get_bank_balance()
+        db = await get_db()
+        async with db.execute("SELECT COUNT(*) FROM auto_payments WHERE is_active = 1 AND COALESCE(is_bank, 0) = 1") as cur:
+            ap_row = await cur.fetchone()
+            bank_ap_count = ap_row[0] if ap_row else 0
+
+        embed = discord.Embed(
+            title=custom_title or "🛡️ Панель Администратора Банка",
+            description=(
+                "Выберите счет игрока или казны фракции из списка ниже, либо воспользуйтесь кнопками управления."
+            ),
+            color=discord.Color.red()
+        )
+        embed.add_field(
+            name="🏦 Счет Центрального Банка",
+            value=f"`{BANK_ACCOUNT_ID}`",
+            inline=True
+        )
+        embed.add_field(
+            name="💰 Капитал Банка",
+            value=f"**{format_money(bank_bal)}**",
+            inline=True
+        )
+        embed.add_field(
+            name="🔄 Автоплатежи Банка",
+            value=f"Активно: **{bank_ap_count}**",
+            inline=True
+        )
+        return embed
+
     async def select_user_cb(self, interaction: discord.Interaction):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
-            return
-        if not await safe_defer(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         acc_id = interaction.data['values'][0]
         u = await get_user_by_account(acc_id)
         if not u:
-            await interaction.followup.send("❌ Счет не найден.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Счет не найден.")
             return
-        await safe_edit_or_send(interaction, embed=build_admin_user_embed(u), view=AdminUserManageView(u))
+        await safe_edit_or_send(interaction, content=None, embed=build_admin_user_embed(u), view=AdminUserManageView(u))
 
-    @button(label="🔎 Поиск игрока", style=ButtonStyle.primary, row=1)
+    @button(label="🏦 Банк и Автоплатежи Банка", style=ButtonStyle.primary, row=1)
+    async def bank_manage_btn(self, interaction: discord.Interaction, button: Button):
+        if not check_is_admin(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
+            return
+        bank_view = await AdminBankManageView.create()
+        embed = await bank_view.build_embed()
+        await safe_edit_or_send(interaction, content=None, embed=embed, view=bank_view)
+
+    @button(label="🔎 Поиск счета", style=ButtonStyle.secondary, row=1)
     async def search_user_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         await safe_send_modal(interaction, AdminSearchModal())
 
     @button(label="📜 История и фильтры", style=ButtonStyle.blurple, row=1)
     async def history_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
-            return
-        if not await safe_defer(interaction):
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         dashboard = TransactionFilterDashboardView()
-        await safe_edit_or_send(interaction, embed=dashboard.build_embed(), view=dashboard)
+        await safe_edit_or_send(interaction, content=None, embed=dashboard.build_embed(), view=dashboard)
 
     @button(label="➕ Зачислить (по ID)", style=ButtonStyle.green, row=2)
     async def add_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         await safe_send_modal(interaction, ManageBalanceModal("add"))
 
     @button(label="➖ Списать (по ID)", style=ButtonStyle.red, row=2)
     async def remove_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         await safe_send_modal(interaction, ManageBalanceModal("remove"))
 
     @button(label="⚙️ Установить (по ID)", style=ButtonStyle.secondary, row=2)
     async def set_btn(self, interaction: discord.Interaction, button: Button):
         if not check_is_admin(interaction):
-            if await safe_defer(interaction, ephemeral=True):
-                await interaction.followup.send("❌ Нет прав.", ephemeral=True)
+            await safe_send_ephemeral(interaction, "❌ Нет прав.")
             return
         await safe_send_modal(interaction, ManageBalanceModal("set"))
 
 
-# --- СОБЫТИЯ И КОМАНДЫ ---
+# --- СОБЫТИЯ И СЛЭШ-КОМАНДЫ (ТОЛЬКО 3 ОСНОВНЫЕ КОМАНДЫ) ---
 
 @bot.event
 async def on_ready():
@@ -1895,92 +2729,40 @@ async def on_ready():
 
 @bot.tree.command(name="start", description="Открыть личный кабинет банка")
 async def start_cmd(interaction: discord.Interaction):
-    if not await safe_defer(interaction, ephemeral=True):
-        return
     user_data = await get_user_data(interaction.user.id)
     if not user_data:
-        await interaction.followup.send("❌ У вас еще нет банковского счета. Обратитесь к технику.", ephemeral=True)
+        await safe_send_ephemeral(interaction, "❌ У вас еще нет банковского счета. Обратитесь к технику.")
         return
     is_leader = check_is_leader(interaction)
-    await interaction.followup.send(
+    await safe_send_ephemeral(
+        interaction,
         embed=build_profile_embed(user_data),
-        view=UserProfileView(user_data, is_leader=is_leader),
-        ephemeral=True
+        view=UserProfileView(user_data, is_leader=is_leader)
     )
 
 
 @bot.tree.command(name="admin_panel", description="Открыть панель администратора банка")
 @app_commands.check(check_is_admin)
 async def admin_panel_cmd(interaction: discord.Interaction):
-    if not await safe_defer(interaction, ephemeral=True):
-        return
-    embed = discord.Embed(
-        title="🛡️ Панель Администратора",
-        description="Выберите игрока из выпадающего списка для быстрых операций или воспользуйтесь кнопками ниже.",
-        color=discord.Color.red()
-    )
     view = await AdminPanelView.create()
-    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    embed = await view.build_embed()
+    await safe_send_ephemeral(interaction, embed=embed, view=view)
 
 
 @bot.tree.command(name="admin_create", description="Создать банковский счет пользователю")
 @app_commands.describe(user="Пользователь Discord, которому создается счет")
 @app_commands.check(check_is_admin)
 async def admin_create_cmd(interaction: discord.Interaction, user: discord.Member):
-    data = await get_user_data(user.id)
-    if data:
-        if await safe_defer(interaction, ephemeral=True):
-            await interaction.followup.send(f"⚠️ У пользователя уже есть счет: `{data[3]}`", ephemeral=True)
-        return
     await safe_send_modal(interaction, CreateAccountModal(user))
-
-
-@bot.tree.command(name="admin_add", description="Зачислить средства пользователю")
-@app_commands.describe(user="Пользователь, которому нужно зачислить средства")
-@app_commands.check(check_is_admin)
-async def admin_add_cmd(interaction: discord.Interaction, user: discord.Member):
-    data = await get_user_data(user.id)
-    if not data:
-        if await safe_defer(interaction, ephemeral=True):
-            await interaction.followup.send("❌ У выбранного пользователя нет счета!", ephemeral=True)
-        return
-    await safe_send_modal(interaction, ManageBalanceModal("add", prefill_account=data[3]))
-
-
-@bot.tree.command(name="admin_remove", description="Списать средства у пользователя")
-@app_commands.describe(user="Пользователь, у которого нужно списать средства")
-@app_commands.check(check_is_admin)
-async def admin_remove_cmd(interaction: discord.Interaction, user: discord.Member):
-    data = await get_user_data(user.id)
-    if not data:
-        if await safe_defer(interaction, ephemeral=True):
-            await interaction.followup.send("❌ У выбранного пользователя нет счета!", ephemeral=True)
-        return
-    await safe_send_modal(interaction, ManageBalanceModal("remove", prefill_account=data[3]))
-
-
-@bot.tree.command(name="admin_set", description="Установить баланс пользователю")
-@app_commands.describe(user="Пользователь, которому нужно установить баланс")
-@app_commands.check(check_is_admin)
-async def admin_set_cmd(interaction: discord.Interaction, user: discord.Member):
-    data = await get_user_data(user.id)
-    if not data:
-        if await safe_defer(interaction, ephemeral=True):
-            await interaction.followup.send("❌ У выбранного пользователя нет счета!", ephemeral=True)
-        return
-    await safe_send_modal(interaction, ManageBalanceModal("set", prefill_account=data[3]))
 
 
 @admin_panel_cmd.error
 @admin_create_cmd.error
-@admin_add_cmd.error
-@admin_remove_cmd.error
-@admin_set_cmd.error
 async def admin_error_handler(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.CheckFailure):
-        await safe_edit_or_send(interaction, content="❌ У вас нет прав для выполнения этой команды.")
+        await safe_send_ephemeral(interaction, "❌ У вас нет прав для выполнения этой команды.")
     else:
-        await safe_edit_or_send(interaction, content=f"❌ Произошла ошибка: {error}")
+        await safe_send_ephemeral(interaction, f"❌ Произошла ошибка: {error}")
 
 
 if __name__ == "__main__":
